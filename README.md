@@ -1,1 +1,1 @@
-# music-editor
+# music-editor -- CLAUDE -- Set up this new repo please 
