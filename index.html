@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- viewport-fit=cover lets the layout run under the Dynamic Island and the
+         home indicator; the safe-area insets in the CSS put padding back. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f5f7fa" media="(prefers-color-scheme: light)" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Editor" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta
+      name="description"
+      content="Trim, fade, normalise and export MP3 and WAV audio in the browser. Nothing is uploaded."
+    />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <link rel="icon" href="/icons/icon-192.png" sizes="192x192" />
+    <title>Music Editor</title>
+  </head>
+  <body>
+    <div id="app" class="app" data-empty="true">
+      <header class="topbar">
+        <label class="button button--ghost" for="file-input">
+          <span aria-hidden="true">＋</span>
+          <span>Open</span>
+        </label>
+        <input id="file-input" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg" hidden />
+
+        <div class="track-name">
+          <span id="track-name" class="track-name__text">No track loaded</span>
+          <span id="track-meta" class="track-name__meta"></span>
+        </div>
+
+        <button id="undo" class="button button--icon" type="button" aria-label="Undo" disabled>↺</button>
+        <button id="redo" class="button button--icon" type="button" aria-label="Redo" disabled>↻</button>
+      </header>
+
+      <main class="stage">
+        <canvas id="waveform" class="waveform" aria-label="Waveform"></canvas>
+
+        <div id="empty-state" class="empty-state">
+          <div class="empty-state__art" aria-hidden="true">🎧</div>
+          <h1>Edit audio on your phone</h1>
+          <p>Open an MP3 or WAV and trim, fade, normalise and export it. Everything happens on this device — no upload, no account.</p>
+          <label class="button button--primary button--wide" for="file-input">Choose a file</label>
+        </div>
+
+        <div id="busy" class="busy" hidden>
+          <div class="busy__card">
+            <div class="busy__label" id="busy-label">Working…</div>
+            <div class="busy__track"><div class="busy__bar" id="busy-bar"></div></div>
+          </div>
+        </div>
+      </main>
+
+      <div class="readout" id="readout">
+        <div class="readout__cell">
+          <span class="readout__label">Playhead</span>
+          <span class="readout__value" id="readout-playhead">0:00.00</span>
+        </div>
+        <div class="readout__cell">
+          <span class="readout__label">Selection</span>
+          <span class="readout__value" id="readout-selection">—</span>
+        </div>
+        <div class="readout__cell">
+          <span class="readout__label">Length</span>
+          <span class="readout__value" id="readout-duration">0:00.00</span>
+        </div>
+      </div>
+
+      <div class="transport">
+        <button class="button button--icon" type="button" data-action="stop" aria-label="Back to start">⏮</button>
+        <button class="button button--play" type="button" data-action="play" aria-label="Play">▶</button>
+        <button class="button button--icon" type="button" data-action="loop" aria-label="Loop selection" aria-pressed="false">⟲</button>
+        <span class="transport__spacer"></span>
+        <button class="button button--icon" type="button" data-action="zoom-out" aria-label="Zoom out">－</button>
+        <button class="button button--icon" type="button" data-action="zoom-in" aria-label="Zoom in">＋</button>
+        <button class="button button--icon" type="button" data-action="zoom-fit" aria-label="Fit to screen">⤢</button>
+      </div>
+
+      <nav class="tools" aria-label="Edit tools">
+        <button class="tool" type="button" data-command="select-all">All</button>
+        <button class="tool" type="button" data-command="trim">Trim</button>
+        <button class="tool" type="button" data-command="cut">Cut</button>
+        <button class="tool" type="button" data-command="copy">Copy</button>
+        <button class="tool" type="button" data-command="paste">Paste</button>
+        <button class="tool" type="button" data-command="delete">Delete</button>
+        <button class="tool" type="button" data-command="silence">Silence</button>
+        <button class="tool" type="button" data-command="fade-in">Fade in</button>
+        <button class="tool" type="button" data-command="fade-out">Fade out</button>
+        <button class="tool" type="button" data-command="normalize">Normalise</button>
+        <button class="tool" type="button" data-command="gain">Gain…</button>
+        <button class="tool" type="button" data-command="speed">Speed…</button>
+        <button class="tool" type="button" data-command="reverse">Reverse</button>
+        <button class="tool" type="button" data-command="dc-offset">Fix DC</button>
+      </nav>
+
+      <footer class="bottombar">
+        <button class="button button--primary button--wide" type="button" data-command="export">Export</button>
+      </footer>
+
+      <div id="toast" class="toast" hidden></div>
+    </div>
+
+    <dialog id="gain-sheet" class="sheet">
+      <form method="dialog" class="sheet__body">
+        <h2 class="sheet__title">Gain</h2>
+        <p class="sheet__hint" id="gain-hint">Applies to the selection.</p>
+        <output class="sheet__readout" id="gain-value">0.0 dB</output>
+        <input id="gain-slider" class="slider" type="range" min="-24" max="24" step="0.5" value="0" />
+        <div class="sheet__actions">
+          <button class="button button--ghost" value="cancel" type="submit">Cancel</button>
+          <button class="button button--primary" value="apply" type="submit">Apply</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="speed-sheet" class="sheet">
+      <form method="dialog" class="sheet__body">
+        <h2 class="sheet__title">Speed</h2>
+        <p class="sheet__hint">Changes pitch too, like tape speed.</p>
+        <output class="sheet__readout" id="speed-value">1.00×</output>
+        <input id="speed-slider" class="slider" type="range" min="0.5" max="2" step="0.05" value="1" />
+        <div class="sheet__actions">
+          <button class="button button--ghost" value="cancel" type="submit">Cancel</button>
+          <button class="button button--primary" value="apply" type="submit">Apply</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="export-sheet" class="sheet">
+      <form method="dialog" class="sheet__body">
+        <h2 class="sheet__title">Export</h2>
+
+        <fieldset class="segmented" id="export-format">
+          <legend class="sheet__label">Format</legend>
+          <label><input type="radio" name="format" value="mp3" checked /><span>MP3</span></label>
+          <label><input type="radio" name="format" value="wav" /><span>WAV</span></label>
+        </fieldset>
+
+        <fieldset class="segmented" id="export-bitrate">
+          <legend class="sheet__label">Bitrate</legend>
+          <label><input type="radio" name="bitrate" value="128" /><span>128k</span></label>
+          <label><input type="radio" name="bitrate" value="192" checked /><span>192k</span></label>
+          <label><input type="radio" name="bitrate" value="256" /><span>256k</span></label>
+          <label><input type="radio" name="bitrate" value="320" /><span>320k</span></label>
+        </fieldset>
+
+        <fieldset class="segmented" id="export-depth" hidden>
+          <legend class="sheet__label">Bit depth</legend>
+          <label><input type="radio" name="depth" value="16" checked /><span>16-bit</span></label>
+          <label><input type="radio" name="depth" value="24" /><span>24-bit</span></label>
+          <label><input type="radio" name="depth" value="32" /><span>32-bit float</span></label>
+        </fieldset>
+
+        <fieldset class="segmented" id="export-scope">
+          <legend class="sheet__label">Range</legend>
+          <label><input type="radio" name="scope" value="all" checked /><span>Whole track</span></label>
+          <label><input type="radio" name="scope" value="selection" /><span>Selection</span></label>
+        </fieldset>
+
+        <p class="sheet__hint" id="export-hint"></p>
+
+        <div class="sheet__actions sheet__actions--stack">
+          <button class="button button--primary button--wide" id="export-share" value="share" type="submit">
+            Share…
+          </button>
+          <button class="button button--ghost button--wide" id="export-download" value="download" type="submit">
+            Download
+          </button>
+          <button class="button button--ghost button--wide" id="export-link" value="link" type="submit" hidden>
+            Create link
+          </button>
+          <button class="button button--quiet button--wide" value="cancel" type="submit">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
