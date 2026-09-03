@@ -17,6 +17,12 @@ removal. Every edit is undoable, and cuts get a 3 ms taper so they do not click.
 **Transport** — play, pause, return to start, loop the selection, scrub, and a
 playhead that keeps itself on screen while playing.
 
+**Positions** — the playhead and both ends of the selection are readouts you can
+type into. They accept `m:ss.cc`, `h:mm:ss.cc` or plain seconds (`83.45`), since
+the iOS decimal keypad has no colon key, and take a comma as the decimal
+separator. Typing one end of a selection when nothing is selected anchors the
+other at the nearest end of the track.
+
 **Waveform** — stereo lanes with a peak envelope and an RMS body, a time ruler,
 clipping markers, and a peak pyramid behind it so a five-minute track redraws at
 60 fps instead of rescanning 26 million samples per frame.
@@ -30,8 +36,9 @@ a link.
 
 - One-finger drag selects, one-finger tap moves the playhead, two-finger pinch
   zooms and two-finger drag pans — the gesture set phone audio apps already use.
-- A one-finger drag in the top 36 px of the waveform pans as well, so getting to
-  another part of a long file does not need a second finger.
+- A one-finger drag in the top 44 px of the waveform pans as well, so getting to
+  another part of a long file does not need a second finger. 44 px is the same
+  tap minimum every button in the app is held to.
 - Holding a selection drag within 36 px of either edge scrolls the viewport at a
   rate proportional to how far into the zone the finger is, which is what makes a
   selection longer than one screenful possible at all.
@@ -44,6 +51,11 @@ a link.
   Island and the transport clears the home indicator.
 - Declares a `playback` audio session, so the editor stays audible with the
   ring/silent switch on.
+- Opening a file never waits on the audio context being allowed to start.
+  `resume()` on a context that may not start is specified to leave its promise
+  pending rather than reject it, so awaiting one outside a user gesture hangs
+  indefinitely; decoding uses a suspended context instead, and the first touch
+  after that starts the transport.
 - Add to Home Screen runs it standalone, and a service worker caches the app
   shell so it opens with no signal.
 - When the page goes to the background it snapshots the current buffer to

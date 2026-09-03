@@ -60,18 +60,66 @@
         </div>
       </main>
 
+      <!--
+        Every position is an editable field. `inputmode="decimal"` rather than
+        `numeric` so the iOS keypad carries a decimal point; it has no colon
+        either way, which is why `parseTimecode` also accepts plain seconds.
+        `font-size: 16px` on `.readout__field` is what stops Safari zooming the
+        page when one of them takes focus.
+      -->
       <div class="readout" id="readout">
-        <div class="readout__cell">
-          <span class="readout__label">Playhead</span>
-          <span class="readout__value" id="readout-playhead">0:00.00</span>
-        </div>
-        <div class="readout__cell">
-          <span class="readout__label">Selection</span>
-          <span class="readout__value" id="readout-selection">—</span>
-        </div>
-        <div class="readout__cell">
+        <div class="readout__row">
+          <label class="readout__label" for="readout-playhead">Playhead</label>
+          <input
+            id="readout-playhead"
+            class="readout__field"
+            type="text"
+            inputmode="decimal"
+            enterkeyhint="done"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
+            data-time-field="true"
+            value="0:00.00"
+          />
+          <span class="readout__spacer"></span>
           <span class="readout__label">Length</span>
           <span class="readout__value" id="readout-duration">0:00.00</span>
+        </div>
+
+        <div class="readout__row">
+          <span class="readout__label" id="readout-selection-label">Selection</span>
+          <input
+            id="readout-selection-start"
+            class="readout__field"
+            type="text"
+            inputmode="decimal"
+            enterkeyhint="done"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
+            data-time-field="true"
+            placeholder="—"
+            aria-label="Selection start"
+          />
+          <span class="readout__dash" aria-hidden="true">–</span>
+          <input
+            id="readout-selection-end"
+            class="readout__field"
+            type="text"
+            inputmode="decimal"
+            enterkeyhint="done"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
+            data-time-field="true"
+            placeholder="—"
+            aria-label="Selection end"
+          />
+          <span class="readout__spacer"></span>
         </div>
       </div>
 

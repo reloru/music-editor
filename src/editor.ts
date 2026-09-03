@@ -101,7 +101,10 @@ export class Editor {
 
   async load(data: ArrayBuffer, name: string): Promise<void> {
     await this.runTask(`Opening ${name}`, async () => {
-      const ctx = this.engine.context ?? (await this.engine.ensureContext());
+      // `acquireContext`, never `ensureContext`: decoding needs a context
+      // object, not a running one, and awaiting a resume outside a user gesture
+      // can hang forever. See AudioEngine.acquireContext.
+      const ctx = this.engine.acquireContext();
       const { pcm, via } = await decodeAudioFile(data, ctx);
       if (frameCount(pcm) === 0) throw new Error('That file contains no audio.');
 
@@ -609,8 +612,55 @@ export class Editor {
   }
 }
 
+/**
+ * Yields one frame, or 50 ms, whichever lands first.
+ *
+ * `runTask` uses this to let the busy overlay paint before the main thread is
+ * blocked, which makes it a step every long operation has to pass through.
+ * requestAnimationFrame does not fire while the document is hidden, and iOS
+ * puts the file picker over the page as a sheet — so a callback scheduled
+ * either side of one can be deferred indefinitely, and with it the whole task.
+ * The timer is the floor.
+ */
 function nextFrame(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    requestAnimationFrame(finish);
+    setTimeout(finish, 50);
+  });
+}
+
+/**
+ * Reads a position the user typed into one of the readout fields.
+ *
+ * Accepts `s`, `m:s`, and `h:m:s`, with an optional fraction on the last part,
+ * and treats a comma as a decimal point — the iOS decimal keypad emits whichever
+ * separator the locale uses, and it has no colon key at all, so plain seconds is
+ * the only form some users can type without switching keyboards.
+ *
+ * Minutes and seconds are not bounded at 60: `1:90` is 150 seconds. That makes
+ * arithmetic on a position ("thirty seconds later") something you can type
+ * directly instead of having to carry.
+ *
+ * Returns null for anything it cannot read, including the empty string, so the
+ * caller decides whether that clears the value or is an error.
+ */
+export function parseTimecode(text: string): number | null {
+  const cleaned = text.trim().replace(/,/g, '.');
+  const match = /^(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d*)?|\.\d+)$/.exec(cleaned);
+  if (!match) return null;
+
+  // With one colon the leading group is minutes; with two it is hours.
+  const [hours, minutes] =
+    match[2] == null ? [0, Number(match[1] ?? 0)] : [Number(match[1]), Number(match[2])];
+  const seconds = Number(match[3]);
+  const total = hours * 3600 + minutes * 60 + seconds;
+  return Number.isFinite(total) ? total : null;
 }
 
 export function formatDuration(seconds: number): string {

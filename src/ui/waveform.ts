@@ -38,12 +38,13 @@ import { dragRange, edgeScrollPush, fingerDistance, pickAnchor } from './gesture
 
 const HANDLE_GRAB_PX = 22;
 const TAP_SLOP_PX = 8;
-const RULER_HEIGHT_PX = 26;
+const RULER_HEIGHT_PX = 30;
 /**
- * Pan strip at the top of the canvas. Larger than the drawn ruler because a
- * 26 px target is smaller than a fingertip.
+ * Pan strip at the top of the canvas: 44 px, the same tap minimum every button
+ * in the app is held to, and still larger than the drawn ruler so the band
+ * forgives a touch that lands just under the tick labels.
  */
-const PAN_STRIP_PX = 36;
+const PAN_STRIP_PX = 44;
 const MIN_ZOOM_SPAN = 64;
 /** How close to an edge a drag has to get before the viewport starts scrolling. */
 const EDGE_SCROLL_PX = 36;
