@@ -86,11 +86,37 @@ body {
   touch-action: manipulation;
 }
 
+/*
+ * `height: 100%` rather than `100dvh`.
+ *
+ * `body` is `position: fixed; inset: 0`, so its box is the layout viewport.
+ * `100dvh` tracks the *visual* viewport instead, and in mobile Safari with the
+ * URL bar showing the two differ by the height of that bar — the grid was
+ * taller than the box it lived in, and with `overflow: hidden` on `body` the
+ * last row (the export button) ended up below the visible area with no way to
+ * scroll to it.
+ */
 .app {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto auto auto auto;
-  height: 100dvh;
-  padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
+  height: 100%;
+  /* Bottom inset is left to `.bottombar` so its surface colour, rather than the
+     page background, fills the home-indicator strip. */
+  padding: var(--safe-top) var(--safe-right) 0 var(--safe-left);
+}
+
+/*
+ * A grid item defaults to `min-width: auto`, which is a floor at its own
+ * content's minimum — and the single implicit column here is sized to the
+ * widest of those floors. The top bar's floor was 358 px, so on a 320 px screen
+ * every row was laid out 38 px wider than the window. Nothing scrolls
+ * sideways (`body` is fixed with hidden overflow), so the undo and redo buttons
+ * sat past the right edge and could not be reached at all. Overriding the floor
+ * makes the rows track the viewport and each one handle its own tight fit — the
+ * track title truncates, the toolbar scrolls.
+ */
+.app > * {
+  min-width: 0;
 }
 
 /* ------------------------------------------------------------------ topbar */
@@ -260,9 +286,20 @@ body {
 
 /* ----------------------------------------------------------------- readout */
 
+/*
+ * `minmax(0, 1fr)`, not `1fr`.
+ *
+ * A bare `1fr` is `minmax(auto, 1fr)`, so each column refuses to go below its
+ * content's min-content width. Three uppercase, letter-spaced labels came to
+ * 358 px together, which is wider than a 320 px phone — and because this row is
+ * a grid item of `.app`, it widened `.app`'s single column and with it every
+ * other row, pushing the right-hand end of the toolbar and the transport out of
+ * a viewport that cannot scroll sideways. Letting the columns shrink keeps the
+ * overflow contained in the one place it belongs.
+ */
 .readout {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1px;
   background: var(--border);
   border-block: 1px solid var(--border);
@@ -272,21 +309,38 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
+  min-width: 0;
   padding: 6px 4px;
   background: var(--surface);
 }
 
 .readout__label {
+  max-width: 100%;
+  overflow: hidden;
   font-size: 10px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-dim);
 }
 
 .readout__value {
   font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  /* Tabular figures so the playhead readout does not jitter as digits change. */
   font-size: 14px;
   font-variant-numeric: tabular-nums;
+}
+
+/* Buys back the width the labels need on a 320 px screen. */
+@media (max-width: 359px) {
+  .readout__label {
+    letter-spacing: 0.02em;
+  }
+
+  .readout__value {
+    font-size: 13px;
+  }
 }
 
 /* --------------------------------------------------------------- transport */
@@ -300,7 +354,33 @@ body {
 }
 
 .transport__spacer {
-  flex: 1;
+  /* Shrinks to nothing before any control does, so the row degrades by losing
+     slack rather than by pushing the last button off the edge. */
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/*
+ * The six controls are 284 px of fixed width between them (five at the 44 px tap
+ * minimum, plus the larger play button). With the default 10 px gaps and 12 px
+ * side padding the row needs 368 px, so it overflowed on every 360 px phone and
+ * clipped the zoom-to-fit button off the right-hand end. Two tiers of tightening
+ * bring the requirement to 326 px and then 312 px, which fits a 320 px screen
+ * with room to spare. The controls themselves are never shrunk — 44 px is the
+ * floor for a touch target, so the slack has to come out of the gaps.
+ */
+@media (max-width: 389px) {
+  .transport {
+    gap: 6px;
+    padding-inline: 6px;
+  }
+}
+
+@media (max-width: 359px) {
+  .transport {
+    gap: 4px;
+    padding-inline: 4px;
+  }
 }
 
 .button[aria-pressed='true'] {
@@ -354,6 +434,9 @@ body {
 
 .bottombar {
   padding: 10px 12px calc(10px + var(--safe-bottom));
+  /* `.app` deliberately does not pad its own bottom, so this is the only place
+     the inset is applied — it used to be counted twice, which left about 34 px
+     of dead background under the export button on a notched iPhone. */
   background: var(--surface);
   border-top: 1px solid var(--border);
 }

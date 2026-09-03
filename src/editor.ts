@@ -35,6 +35,19 @@ export interface Notice {
   text: string;
 }
 
+/**
+ * What undo restores. Storing only the audio was the reason a selection
+ * disappeared after undoing a trim or a delete: those commands clear the
+ * selection as part of the edit, and there was nothing left to put back.
+ * Position is part of the document state, so it travels with it.
+ */
+interface Snapshot {
+  pcm: Pcm;
+  selection: Range | null;
+  playhead: number;
+  view: Range;
+}
+
 /** Smallest window the viewport will zoom into, in samples. */
 const MIN_VIEW_SAMPLES = 64;
 
@@ -56,7 +69,13 @@ export class Editor {
   dirty = false;
 
   private playheadSamples = 0;
-  private readonly history = new History<Pcm>({ sizeOf: byteSize });
+  /**
+   * Bumped whenever the sample data changes. The waveform keys its offscreen
+   * cache on this, so it can tell "same audio, different viewport" from "new
+   * audio" without comparing buffers.
+   */
+  revision = 0;
+  private readonly history = new History<Snapshot>({ sizeOf: (state) => byteSize(state.pcm) });
   private readonly listeners = new Set<() => void>();
 
   constructor() {
@@ -102,6 +121,7 @@ export class Editor {
   close(): void {
     this.history.clear();
     this.pcm = null;
+    this.revision++;
     this.peaks = null;
     this.fileName = '';
     this.selection = null;
@@ -132,6 +152,11 @@ export class Editor {
 
   get channels(): number {
     return this.pcm ? channelCount(this.pcm) : 0;
+  }
+
+  /** Bytes retained by the undo and redo stacks. */
+  get historyBytes(): number {
+    return this.history.bytes;
   }
 
   get canUndo(): boolean {
@@ -435,23 +460,61 @@ export class Editor {
   // ------------------------------------------------------------ undo and redo
 
   undo(): void {
-    if (!this.pcm) return;
-    const entry = this.history.undo(this.pcm);
+    if (!this.pcm || !this.history.canUndo) return;
+    const entry = this.history.undo(this.snapshot());
     if (!entry) return;
-    this.setPcm(entry.value, { resetView: false });
+    this.restore(entry.value);
     this.notice = { kind: 'info', text: `Undid ${entry.label.toLowerCase()}` };
     this.dirty = true;
     this.emit();
   }
 
   redo(): void {
-    if (!this.pcm) return;
-    const entry = this.history.redo(this.pcm);
+    if (!this.pcm || !this.history.canRedo) return;
+    const entry = this.history.redo(this.snapshot());
     if (!entry) return;
-    this.setPcm(entry.value, { resetView: false });
+    this.restore(entry.value);
     this.notice = { kind: 'info', text: `Redid ${entry.label.toLowerCase()}` };
     this.dirty = true;
     this.emit();
+  }
+
+  /** The full document state, for the opposite stack to hold onto. */
+  private snapshot(): Snapshot {
+    if (!this.pcm) throw new Error('No document to snapshot');
+    return {
+      pcm: this.pcm,
+      selection: this.selection ? { ...this.selection } : null,
+      playhead: this.playheadSamples,
+      view: { ...this.view },
+    };
+  }
+
+  /**
+   * Puts a whole document state back, position included.
+   *
+   * `setPcm` re-derives the viewport from the buffer length, so the recorded
+   * viewport and selection are applied afterwards and clamped to the buffer
+   * they are being restored onto — an undo can only ever widen the buffer back
+   * to a length the recorded ranges already fitted, but a truncated redo stack
+   * makes no such promise.
+   */
+  private restore(state: Snapshot): void {
+    this.setPcm(state.pcm, { resetView: false });
+    const total = frameCount(state.pcm);
+
+    const width = Math.max(MIN_VIEW_SAMPLES, Math.min(total, state.view.end - state.view.start));
+    const start = Math.max(0, Math.min(total - width, state.view.start));
+    this.view = width >= total ? { start: 0, end: total } : { start, end: start + width };
+
+    if (state.selection) {
+      const clamped = clampRange(state.pcm, state.selection);
+      this.selection = clamped.end > clamped.start ? clamped : null;
+    } else {
+      this.selection = null;
+    }
+
+    this.playhead = Math.min(state.playhead, total);
   }
 
   // ----------------------------------------------------------------- internals
@@ -463,13 +526,16 @@ export class Editor {
   async applyEdit(label: string, operation: (pcm: Pcm) => Pcm | Promise<Pcm>): Promise<void> {
     const current = this.pcm;
     if (!current) return;
+    // Captured before the operation runs, and before the caller adjusts the
+    // selection for the post-edit state.
+    const before = this.snapshot();
 
     await this.runTask(label, async () => {
       const next = await operation(current);
       if (frameCount(next) === 0) {
         throw new Error('That edit would leave an empty track.');
       }
-      this.history.record(label, current);
+      this.history.record(label, before);
       this.setPcm(next, { resetView: false });
       this.dirty = true;
     });
@@ -478,6 +544,7 @@ export class Editor {
   private setPcm(pcm: Pcm, options: { resetView: boolean }): void {
     const previousTotal = this.totalSamples;
     this.pcm = pcm;
+    this.revision++;
     this.peaks = buildPeaks(pcm);
     this.engine.setPcm(pcm);
 

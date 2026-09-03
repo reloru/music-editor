@@ -19,8 +19,8 @@ interface ServerConfig {
 }
 
 export class App {
-  private readonly editor = new Editor();
-  private readonly waveform: WaveformView;
+  readonly editor = new Editor();
+  readonly waveform: WaveformView;
   private readonly elements = queryElements();
   private config: ServerConfig = { sharing: false, maxShareBytes: 0, shareTtlSeconds: 0 };
   private toastTimer = 0;
@@ -422,28 +422,42 @@ export class App {
 
   // --------------------------------------------------------------- rendering
 
+  /**
+   * Pushes editor state into the DOM.
+   *
+   * Every write goes through `setText` / `setFlag`, which compare before
+   * assigning. This runs on every `pointermove` of a selection drag — the editor
+   * emits a change for each one — and assigning `textContent` or `disabled`
+   * unconditionally invalidates style and layout for that element even when the
+   * value is identical, which put a dozen avoidable layout invalidations inside
+   * every drag frame.
+   */
   private sync(): void {
     const editor = this.editor;
     const has = editor.hasAudio;
 
-    this.elements.app.dataset.empty = String(!has);
-    this.elements.trackName.textContent = editor.fileName || 'No track loaded';
-    this.elements.trackMeta.textContent = has
-      ? `${describeChannels(editor.channels)} · ${(editor.sampleRate / 1000).toFixed(1)} kHz · ${formatDuration(editor.durationSeconds)}`
-      : '';
+    const empty = String(!has);
+    if (this.elements.app.dataset.empty !== empty) this.elements.app.dataset.empty = empty;
+    setText(this.elements.trackName, editor.fileName || 'No track loaded');
+    setText(
+      this.elements.trackMeta,
+      has
+        ? `${describeChannels(editor.channels)} · ${(editor.sampleRate / 1000).toFixed(1)} kHz · ${formatDuration(editor.durationSeconds)}`
+        : '',
+    );
 
-    this.elements.undo.disabled = !editor.canUndo;
-    this.elements.redo.disabled = !editor.canRedo;
-    this.elements.undo.title = editor.undoLabel ? `Undo ${editor.undoLabel}` : 'Undo';
-    this.elements.redo.title = editor.redoLabel ? `Redo ${editor.redoLabel}` : 'Redo';
+    setFlag(this.elements.undo, !editor.canUndo);
+    setFlag(this.elements.redo, !editor.canRedo);
+    setAttr(this.elements.undo, 'title', editor.undoLabel ? `Undo ${editor.undoLabel}` : 'Undo');
+    setAttr(this.elements.redo, 'title', editor.redoLabel ? `Redo ${editor.redoLabel}` : 'Redo');
 
-    this.elements.play.textContent = editor.playing ? '❚❚' : '▶';
-    this.elements.play.setAttribute('aria-label', editor.playing ? 'Pause' : 'Play');
-    this.elements.loop.setAttribute('aria-pressed', String(editor.loop));
+    setText(this.elements.play, editor.playing ? '❚❚' : '▶');
+    setAttr(this.elements.play, 'aria-label', editor.playing ? 'Pause' : 'Play');
+    setAttr(this.elements.loop, 'aria-pressed', String(editor.loop));
 
     for (const button of this.elements.tools) {
       const command = button.dataset.command ?? '';
-      button.disabled = !has || !this.isCommandAvailable(command);
+      setFlag(button, !has || !this.isCommandAvailable(command));
     }
 
     this.updateReadout();
@@ -469,14 +483,14 @@ export class App {
 
   private updateReadout(): void {
     const editor = this.editor;
-    this.elements.readoutPlayhead.textContent = formatDuration(editor.samplesToSeconds(editor.playhead));
-    this.elements.readoutDuration.textContent = formatDuration(editor.durationSeconds);
+    setText(this.elements.readoutPlayhead, formatDuration(editor.samplesToSeconds(editor.playhead)));
+    setText(this.elements.readoutDuration, formatDuration(editor.durationSeconds));
 
     if (editor.hasSelection && editor.selection) {
       const length = editor.samplesToSeconds(editor.selection.end - editor.selection.start);
-      this.elements.readoutSelection.textContent = formatDuration(length);
+      setText(this.elements.readoutSelection, formatDuration(length));
     } else {
-      this.elements.readoutSelection.textContent = '—';
+      setText(this.elements.readoutSelection, '—');
     }
   }
 
@@ -539,6 +553,18 @@ export class App {
 }
 
 // ----------------------------------------------------------------- utilities
+
+function setText(element: HTMLElement, value: string): void {
+  if (element.textContent !== value) element.textContent = value;
+}
+
+function setFlag(element: HTMLButtonElement, disabled: boolean): void {
+  if (element.disabled !== disabled) element.disabled = disabled;
+}
+
+function setAttr(element: HTMLElement, name: string, value: string): void {
+  if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+}
 
 function queryElements() {
   const need = <T extends Element>(selector: string): T => {

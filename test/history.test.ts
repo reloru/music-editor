@@ -81,6 +81,57 @@ describe('History', () => {
     expect(history.undo('y')?.value).toHaveLength(1000);
   });
 
+  it('gives up redo before undo when the byte budget is tight', () => {
+    // Undo is the operation a user reaches for after a mistake; redo only
+    // matters after an undo. When something has to be evicted, the reachable
+    // past is worth more than a speculative future.
+    const history = new History<string>({ sizeOf, maxBytes: 12 });
+    history.record('one', 'aaa');
+    history.record('two', 'bbb');
+    history.undo('ccc');
+    history.undo('ddd');
+    expect(history.canRedo).toBe(true);
+
+    // Redoing pushes an 11-byte state onto the past, taking the total to 14.
+    const deep = 'x'.repeat(11);
+    history.redo(deep);
+
+    expect(history.bytes).toBeLessThanOrEqual(12);
+    expect(history.canUndo).toBe(true);
+    expect(history.canRedo).toBe(false);
+  });
+
+  it('keeps the byte count honest across every operation', () => {
+    const history = new History<string>({ sizeOf });
+    history.record('one', 'aaaa');
+    history.record('two', 'bb');
+    expect(history.bytes).toBe(6);
+
+    history.undo('cccccc');
+    expect(history.bytes).toBe(4 + 6);
+
+    history.redo('bb');
+    expect(history.bytes).toBe(4 + 2);
+
+    history.record('three', 'd');
+    expect(history.bytes).toBe(4 + 2 + 1);
+  });
+
+  it('holds a long session at the byte ceiling, not above it', () => {
+    const history = new History<string>({ sizeOf, maxEntries: 1000, maxBytes: 4096 });
+    const chunk = 'y'.repeat(256);
+
+    for (let i = 0; i < 400; i++) {
+      history.record(`edit ${i}`, chunk);
+      expect(history.bytes).toBeLessThanOrEqual(4096);
+    }
+
+    // 4096 / 256, exactly: no drift from the running total falling out of step
+    // with the entries it is meant to describe.
+    expect(history.depth).toBe(16);
+    expect(history.undoLabel).toBe('edit 399');
+  });
+
   it('clears both stacks', () => {
     const history = new History<string>({ sizeOf });
     history.record('one', 'a');

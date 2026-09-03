@@ -30,8 +30,16 @@ a link.
 
 - One-finger drag selects, one-finger tap moves the playhead, two-finger pinch
   zooms and two-finger drag pans — the gesture set phone audio apps already use.
-- Selection edges have a 22 px grab zone, and every control is at least a 44 pt
+- A one-finger drag in the top 36 px of the waveform pans as well, so getting to
+  another part of a long file does not need a second finger.
+- Holding a selection drag within 36 px of either edge scrolls the viewport at a
+  rate proportional to how far into the zone the finger is, which is what makes a
+  selection longer than one screenful possible at all.
+- Selection edges have a 22 px grab zone and the nearer edge wins, so a narrow
+  selection does not drag from the wrong end. Every control is at least a 44 pt
   tap target. An end-to-end test asserts this so it cannot regress.
+- Undo and redo restore the selection, the playhead and the zoom level along with
+  the audio, so walking an edit back leaves the screen where it was.
 - `viewport-fit=cover` plus safe-area insets: the header clears the Dynamic
   Island and the transport clears the home indicator.
 - Declares a `playback` audio session, so the editor stays audible with the
@@ -40,8 +48,11 @@ a link.
   shell so it opens with no signal.
 - When the page goes to the background it snapshots the current buffer to
   IndexedDB, so a tab that iOS discards mid-edit comes back where you left it.
-- 43 KB of JavaScript for the editor (14 KB gzipped); the 165 KB MP3 encoder is
+- 49 KB of JavaScript for the editor (15 KB gzipped); the 165 KB MP3 encoder is
   only fetched when you actually export an MP3.
+- The waveform renders to an off-screen canvas that is reused while the audio and
+  the zoom level hold still, so dragging a selection costs one blit plus two
+  overlays instead of thousands of individual fills.
 
 ## Getting started
 
@@ -63,8 +74,9 @@ npm run cf:dev
 | --- | --- |
 | `npm run dev` | Vite dev server with hot reload |
 | `npm run build` | Production build into `dist/` |
+| `npm run build:probe` | Build into `dist-probe/` with the gesture harness hook |
 | `npm run typecheck` | Typechecks the app, the Worker and the tooling |
-| `npm test` | Unit tests (DSP, WAV, peaks, history, Worker) |
+| `npm test` | Unit tests (DSP, WAV, peaks, history, undo, gestures, Worker) |
 | `npm run test:e2e` | Playwright suite in Chromium at iPhone 14 Pro Max size |
 | `npm run icons` | Regenerates `public/icons` from `scripts/generate-icons.mjs` |
 | `npm run deploy` | Builds and deploys with Wrangler |
@@ -141,7 +153,7 @@ full scale, and clamping happens once, at export.
 ## Testing
 
 ```bash
-npm test          # 79 unit tests
+npm test          # 134 unit tests
 npm run test:e2e  # 14 end-to-end tests in a real browser
 ```
 
@@ -157,11 +169,43 @@ npm run build && npm run cf:dev          # in one terminal
 E2E_BASE_URL=http://127.0.0.1:8787 npm run test:e2e
 ```
 
+### Touch, layout and drag harnesses
+
+Three scripts in `tools/` cover things unit tests cannot see: what multi-touch
+actually does, whether anything is off-screen on a narrow phone, and how long a
+frame takes while a selection is being dragged. Each takes `BASE` (defaults to
+`127.0.0.1:4321`, or `4325` for the gesture probe) and `AUDIO`, and each
+generates its own test WAV on first run via `tools/fixture.mjs`.
+
+```bash
+npm run build && npx http-server dist -p 4321       # or any static server
+node tools/layout-check.mjs                          # 7 viewports, 320px to landscape
+THROTTLE=6 node tools/drag-bench.mjs                 # ms/frame under CPU throttling
+
+npm run build:probe && npx http-server dist-probe -p 4325
+node tools/gesture-probe.mjs                         # 6 multi-touch behaviours
+```
+
+`gesture-probe.mjs` dispatches real multi-touch through CDP, because Playwright's
+touch API only taps. It reads the viewport range and the selection from
+`window.__app`, which exists **only** in the `probe` build mode — `MODE` is a
+compile-time constant, so the hook is dropped from the production bundle rather
+than shipped behind a runtime check. The six checks are: a rotating pinch does
+not zoom, the finger still down keeps control when the other lifts, grabbing a
+handle moves the nearer edge, holding a drag at the edge scrolls the viewport, a
+one-finger drag in the top strip pans without disturbing the selection, and undo
+restores the selection along with the audio.
+
+`layout-check.mjs` fails on any control whose box falls outside the window, which
+is how a 320 px regression shows up: `body` is fixed with hidden overflow, so
+anything past the right edge is not merely awkward, it is unreachable.
+
 ## Known limits
 
-- Undo history is capped by both entry count and total bytes (512 MB by
-  default), because a five-minute stereo buffer is roughly 115 MB and iOS will
-  kill a tab that grows too far. The oldest states are dropped first.
+- Undo history is capped by both entry count and total bytes (160 MB and 12
+  entries by default), because a five-minute stereo buffer is roughly 115 MB and
+  iOS will kill a tab that grows too far. Redo states are dropped before undo
+  states, and at least one undo step is always kept.
 - Session snapshots are skipped above ~64 MB; past that, writing during
   `pagehide` is slower than the eviction it is meant to survive.
 - Speed change moves pitch with it, like tape. There is no time-stretch.
