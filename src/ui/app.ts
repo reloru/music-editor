@@ -4,7 +4,7 @@
  * This layer owns no audio state — it reads the editor after every change
  * event, and turns taps into editor commands.
  */
-import { Editor, formatDuration } from '../editor';
+import { Editor, formatDuration, parseTimecode } from '../editor';
 import { WaveformView } from './waveform';
 import { exportAudio, type ExportFormat } from '../audio/export';
 import { slice } from '../audio/dsp';
@@ -35,9 +35,11 @@ export class App {
     this.bindHistory();
     this.bindTransport();
     this.bindTools();
+    this.bindReadout();
     this.bindSheets();
     this.bindKeyboard();
     this.bindLifecycle();
+    this.bindAudioUnlock();
 
     this.sync();
     void this.loadConfig();
@@ -153,6 +155,100 @@ export class App {
     }
   }
 
+  /**
+   * Makes the three positions in the readout typeable.
+   *
+   * Each field commits on Enter or blur and reverts on Escape. A field the user
+   * has started typing into is left alone by `updateReadout` until it commits,
+   * so the document can keep moving underneath — the playhead during playback,
+   * the selection during a drag — without overwriting a half-finished entry.
+   */
+  private bindReadout(): void {
+    const editor = this.editor;
+
+    this.bindTimeField(this.elements.readoutPlayhead, (seconds) => {
+      if (seconds == null) return false;
+      editor.seekToSamples(editor.secondsToSamples(seconds));
+      return true;
+    });
+
+    // With no selection yet, typing one end anchors the other at the nearest
+    // end of the track, so a selection can be made entirely from the keyboard.
+    this.bindTimeField(this.elements.readoutSelectionStart, (seconds) => {
+      if (seconds == null) {
+        editor.clearSelection();
+        return true;
+      }
+      const end = editor.selection?.end ?? editor.totalSamples;
+      editor.setSelection({ start: editor.secondsToSamples(seconds), end });
+      return true;
+    });
+
+    this.bindTimeField(this.elements.readoutSelectionEnd, (seconds) => {
+      if (seconds == null) {
+        editor.clearSelection();
+        return true;
+      }
+      const start = editor.selection?.start ?? 0;
+      editor.setSelection({ start, end: editor.secondsToSamples(seconds) });
+      return true;
+    });
+
+    // Touching the waveform dismisses the keyboard, and commits whatever was
+    // typed, before the gesture underneath it begins. Capture phase on the
+    // document so it runs ahead of the canvas's own pointerdown handler.
+    document.addEventListener(
+      'pointerdown',
+      (event) => {
+        const active = document.activeElement;
+        if (active instanceof HTMLInputElement && active.dataset.timeField === 'true') {
+          if (event.target !== active) active.blur();
+        }
+      },
+      true,
+    );
+  }
+
+  /**
+   * `commit` receives the parsed position in seconds, or null when the field
+   * was cleared, and reports whether it accepted the value. Anything that fails
+   * to parse never reaches it.
+   */
+  private bindTimeField(input: HTMLInputElement, commit: (seconds: number | null) => boolean): void {
+    input.addEventListener('input', () => {
+      input.dataset.dirty = 'true';
+    });
+
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        input.blur();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        delete input.dataset.dirty;
+        input.blur();
+      }
+    });
+
+    input.addEventListener('blur', () => {
+      const edited = input.dataset.dirty === 'true';
+      delete input.dataset.dirty;
+      if (!edited) return;
+
+      const text = input.value.trim();
+      const seconds = text === '' ? null : parseTimecode(text);
+      if (text !== '' && seconds == null) {
+        this.showToast('Type a time like 1:23.45, or seconds like 83.45', 'error');
+        // Nothing changed in the editor, so put the field back by hand.
+        this.updateReadout();
+        return;
+      }
+      // Clamping and inversion are the editor's job — `setSelection` normalises
+      // a start typed past the end — so a rejected commit is not expected here.
+      if (!commit(seconds)) this.updateReadout();
+    });
+  }
+
   private bindSheets(): void {
     const { gainSheet, gainSlider, gainValue, gainHint } = this.elements;
     gainSlider.addEventListener('input', () => {
@@ -225,6 +321,28 @@ export class App {
     });
     // `pagehide` is the one iOS reliably delivers when a tab is being discarded.
     window.addEventListener('pagehide', () => void this.snapshot());
+  }
+
+  /**
+   * Starts the audio context on the first touch after it exists.
+   *
+   * Opening a file creates the context but deliberately does not resume it —
+   * see `AudioEngine.acquireContext` for why awaiting that outside a gesture
+   * hangs. So the context is left suspended, and this puts it into `running` on
+   * the next tap anywhere, which means the transport is already live by the
+   * time the user reaches the play button. It unsubscribes once that lands.
+   */
+  private bindAudioUnlock(): void {
+    const unlock = (): void => {
+      const context = this.editor.engine.context;
+      if (!context) return;
+      if (context.state === 'running') {
+        document.removeEventListener('pointerdown', unlock, true);
+        return;
+      }
+      void this.editor.engine.ensureContext();
+    };
+    document.addEventListener('pointerdown', unlock, true);
   }
 
   // -------------------------------------------------------------------- files
@@ -483,15 +601,20 @@ export class App {
 
   private updateReadout(): void {
     const editor = this.editor;
-    setText(this.elements.readoutPlayhead, formatDuration(editor.samplesToSeconds(editor.playhead)));
+    setField(this.elements.readoutPlayhead, formatDuration(editor.samplesToSeconds(editor.playhead)));
     setText(this.elements.readoutDuration, formatDuration(editor.durationSeconds));
 
-    if (editor.hasSelection && editor.selection) {
-      const length = editor.samplesToSeconds(editor.selection.end - editor.selection.start);
-      setText(this.elements.readoutSelection, formatDuration(length));
-    } else {
-      setText(this.elements.readoutSelection, '—');
-    }
+    // Empty rather than a dash when nothing is selected: the placeholder draws
+    // the dash, and an empty field is what the commit handler reads as "clear".
+    const selection = editor.hasSelection ? editor.selection : null;
+    setField(
+      this.elements.readoutSelectionStart,
+      selection ? formatDuration(editor.samplesToSeconds(selection.start)) : '',
+    );
+    setField(
+      this.elements.readoutSelectionEnd,
+      selection ? formatDuration(editor.samplesToSeconds(selection.end)) : '',
+    );
   }
 
   private updateBusy(): void {
@@ -558,6 +681,18 @@ function setText(element: HTMLElement, value: string): void {
   if (element.textContent !== value) element.textContent = value;
 }
 
+/**
+ * Writes a readout field, unless the user is mid-edit in it.
+ *
+ * Focus alone is not the guard — you can tap a field, then drag the waveform,
+ * and the field should follow the drag. Only an actual keystroke sets `dirty`,
+ * and committing or reverting clears it.
+ */
+function setField(input: HTMLInputElement, value: string): void {
+  if (input.dataset.dirty === 'true') return;
+  if (input.value !== value) input.value = value;
+}
+
 function setFlag(element: HTMLButtonElement, disabled: boolean): void {
   if (element.disabled !== disabled) element.disabled = disabled;
 }
@@ -584,8 +719,9 @@ function queryElements() {
     play: need<HTMLButtonElement>('[data-action="play"]'),
     loop: need<HTMLButtonElement>('[data-action="loop"]'),
     tools: Array.from(document.querySelectorAll<HTMLButtonElement>('.tool')),
-    readoutPlayhead: need<HTMLElement>('#readout-playhead'),
-    readoutSelection: need<HTMLElement>('#readout-selection'),
+    readoutPlayhead: need<HTMLInputElement>('#readout-playhead'),
+    readoutSelectionStart: need<HTMLInputElement>('#readout-selection-start'),
+    readoutSelectionEnd: need<HTMLInputElement>('#readout-selection-end'),
     readoutDuration: need<HTMLElement>('#readout-duration'),
     busy: need<HTMLElement>('#busy'),
     busyLabel: need<HTMLElement>('#busy-label'),

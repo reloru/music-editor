@@ -287,35 +287,46 @@ body {
 /* ----------------------------------------------------------------- readout */
 
 /*
- * `minmax(0, 1fr)`, not `1fr`.
+ * Two rows of label-then-value, laid out inline rather than stacked.
  *
- * A bare `1fr` is `minmax(auto, 1fr)`, so each column refuses to go below its
- * content's min-content width. Three uppercase, letter-spaced labels came to
- * 358 px together, which is wider than a 320 px phone — and because this row is
- * a grid item of `.app`, it widened `.app`'s single column and with it every
- * other row, pushing the right-hand end of the toolbar and the transport out of
- * a viewport that cannot scroll sideways. Letting the columns shrink keeps the
- * overflow contained in the one place it belongs.
+ * The three positions used to be a three-column grid of stacked label/value
+ * pairs. Making them editable pushed each value from a 14 px span to a 16 px
+ * input — 16 px is the threshold below which Safari zooms the page on focus,
+ * which is not negotiable on a control the user is expected to tap — and the
+ * selection now needs two of those side by side. Three columns of that does not
+ * fit a 320 px screen; two inline rows do, with room to spare.
+ *
+ * `min-width: 0` on the rows for the same reason the old grid used
+ * `minmax(0, 1fr)`: this is a grid item of `.app`, whose single column is sized
+ * to the widest content minimum among its rows, so anything here that refuses
+ * to shrink widens every other row along with it.
  */
 .readout {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 1px;
   background: var(--border);
   border-block: 1px solid var(--border);
 }
 
-.readout__cell {
+.readout__row {
   display: flex;
-  flex-direction: column;
   align-items: center;
+  gap: 6px;
   min-width: 0;
-  padding: 6px 4px;
+  padding: 4px 10px;
   background: var(--surface);
 }
 
+.readout__spacer {
+  /* Absorbs the slack, so the two rows' fields stay left-aligned with each
+     other and the length readout stays pinned to the right. */
+  flex: 1 1 0;
+  min-width: 0;
+}
+
 .readout__label {
-  max-width: 100%;
+  flex: 0 0 auto;
   overflow: hidden;
   font-size: 10px;
   letter-spacing: 0.04em;
@@ -326,14 +337,61 @@ body {
 }
 
 .readout__value {
+  flex: 0 0 auto;
   font-family: ui-monospace, 'SF Mono', Menlo, monospace;
   /* Tabular figures so the playhead readout does not jitter as digits change. */
   font-size: 14px;
   font-variant-numeric: tabular-nums;
 }
 
+.readout__dash {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+
+/*
+ * `width` in `ch` rather than a flexible basis: the field holds exactly
+ * `m:ss.cc`, and a fixed width keeps the two selection fields from resizing
+ * against each other as digits are typed. The `+ 14px` is the padding and
+ * borders, which `box-sizing: border-box` would otherwise take out of the 8
+ * characters — leaving room for seven and clipping the last digit.
+ */
+.readout__field {
+  flex: 0 0 auto;
+  width: calc(8ch + 14px);
+  min-height: 38px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  /* Not below 16 px: Safari zooms the page when a smaller field takes focus. */
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  touch-action: manipulation;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.readout__field::placeholder {
+  color: var(--text-dim);
+  opacity: 1;
+}
+
+.readout__field:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 /* Buys back the width the labels need on a 320 px screen. */
 @media (max-width: 359px) {
+  .readout__row {
+    gap: 4px;
+    padding-inline: 6px;
+  }
+
   .readout__label {
     letter-spacing: 0.02em;
   }

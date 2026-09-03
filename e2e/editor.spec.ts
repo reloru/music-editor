@@ -97,11 +97,54 @@ test.describe('editor', () => {
     await openFixture(page);
     await expect(page.locator('[data-command="trim"]')).toBeDisabled();
 
+    await expect(page.locator('#readout-selection-start')).toHaveValue('');
+
     await selectMiddle(page);
 
-    await expect(page.locator('#readout-selection')).not.toHaveText('—');
+    await expect(page.locator('#readout-selection-start')).not.toHaveValue('');
+    await expect(page.locator('#readout-selection-end')).not.toHaveValue('');
     await expect(page.locator('[data-command="trim"]')).toBeEnabled();
     await expect(page.locator('[data-command="cut"]')).toBeEnabled();
+  });
+
+  test('types a selection into the readout fields', async ({ page }) => {
+    await openFixture(page);
+    await expect(page.locator('[data-command="trim"]')).toBeDisabled();
+
+    await page.locator('#readout-selection-start').fill('0:01.00');
+    await page.locator('#readout-selection-start').press('Enter');
+    await page.locator('#readout-selection-end').fill('2.5');
+    await page.locator('#readout-selection-end').press('Enter');
+
+    // Bare seconds come back formatted, and the range reaches the tools.
+    await expect(page.locator('#readout-selection-end')).toHaveValue('0:02.50');
+    await expect(page.locator('[data-command="trim"]')).toBeEnabled();
+
+    await page.locator('[data-command="trim"]').click();
+    await expect(page.locator('#readout-duration')).toHaveText('0:01.50');
+  });
+
+  test('types a playhead position into the readout', async ({ page }) => {
+    await openFixture(page);
+
+    await page.locator('#readout-playhead').fill('1:02.25');
+    await page.locator('#readout-playhead').press('Enter');
+    // Past the end of a 3 s track it clamps rather than being refused.
+    await expect(page.locator('#readout-playhead')).toHaveValue('0:03.00');
+
+    await page.locator('#readout-playhead').fill('0:01.50');
+    await page.locator('#readout-playhead').press('Enter');
+    await expect(page.locator('#readout-playhead')).toHaveValue('0:01.50');
+  });
+
+  test('rejects an unreadable time instead of moving the playhead', async ({ page }) => {
+    await openFixture(page);
+
+    await page.locator('#readout-playhead').fill('half past four');
+    await page.locator('#readout-playhead').press('Enter');
+
+    await expect(page.locator('#toast')).toHaveAttribute('data-kind', 'error');
+    await expect(page.locator('#readout-playhead')).toHaveValue('0:00.00');
   });
 
   test('trims to the selection and undoes back to the original length', async ({ page }) => {

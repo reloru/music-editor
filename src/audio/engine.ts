@@ -12,6 +12,9 @@ import { toAudioBuffer } from './decode';
 
 export type EngineState = 'stopped' | 'playing';
 
+/** How long `ensureContext` waits for a resume that may never settle. */
+const RESUME_TIMEOUT_MS = 400;
+
 export interface PlayOptions {
   from: number;
   to?: number | null;
@@ -33,13 +36,40 @@ export class AudioEngine {
   onStateChange: ((state: EngineState) => void) | null = null;
 
   /**
-   * Creates the AudioContext. iOS only lets a context leave the `suspended`
-   * state inside a user gesture, so every play path calls this first.
+   * The AudioContext, created on first use and left in whatever state it is in.
+   *
+   * Everything that is not playback goes through here rather than through
+   * `ensureContext`, because none of it needs a *running* context: decoding a
+   * file and building an AudioBuffer both work while the context is suspended.
+   *
+   * The distinction is load-bearing. Per the Web Audio API's `resume()`
+   * algorithm, a context that is "not allowed to start" — which on iOS means
+   * outside a user gesture — has the promise appended to
+   * `[[pending resume promises]]` and the remaining steps aborted, so it is
+   * neither resolved nor rejected until a gesture arrives. Awaiting that from
+   * the file-open path is why opening a track used to sit under "Opening…"
+   * until the user tapped Open a second time, and why the second tap then
+   * finished it instantly: the tap was the gesture that settled the first
+   * promise.
+   */
+  acquireContext(): AudioContext {
+    return this.createContextIfNeeded();
+  }
+
+  /**
+   * Creates the context and tries to start it. Only ever await this from inside
+   * a user gesture; see `acquireContext` for what happens otherwise. The race
+   * is the backstop for the paths that reach here indirectly — a `seek()`
+   * during playback, say — so the worst case is audio that stays silent until
+   * the next tap rather than a caller that never returns.
    */
   async ensureContext(): Promise<AudioContext> {
     const ctx = this.createContextIfNeeded();
     if (ctx.state === 'suspended') {
-      await ctx.resume();
+      await Promise.race([
+        ctx.resume().catch(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, RESUME_TIMEOUT_MS)),
+      ]);
     }
     return ctx;
   }
