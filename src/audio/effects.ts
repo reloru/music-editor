@@ -457,6 +457,17 @@ export function aexciter(pcm: Pcm, range: Range, p: EffectValues): Pcm {
 const SOFTCLIP_CURVES = ['hard', 'tanh', 'atan', 'cubic', 'exp', 'alg', 'quintic', 'sin', 'erf'] as const;
 
 /**
+ * Input frames per pass of the oversampled soft-clip path.
+ *
+ * One buffer over the whole selection would be the selection times the
+ * oversampling factor: at 8× a five-minute stereo track wants the better part
+ * of a gigabyte, which a phone answers by killing the tab. The only state that
+ * has to survive a block boundary is the two biquads, so this is exactly
+ * equivalent to processing it in one pass.
+ */
+const SOFTCLIP_BLOCK = 8192;
+
+/**
  * `asoftclip` — libavfilter/af_asoftclip.c.
  *
  * Nine saturation curves, all applied to the signal scaled by 1/threshold and
@@ -507,7 +518,7 @@ export function asoftclip(pcm: Pcm, range: Range, p: EffectValues): Pcm {
 
   // Cutoff at the original Nyquist, running at the oversampled rate.
   const antiAlias = normalizeDcGain(lowPass(pcm.sampleRate * oversample, pcm.sampleRate / 2, 0.8));
-  const work = oversample > 1 ? new Float64Array(length * oversample) : null;
+  const work = oversample > 1 ? new Float64Array(SOFTCLIP_BLOCK * oversample) : null;
 
   for (let c = 0; c < pcm.channels.length; c++) {
     const source = pcm.channels[c];
@@ -518,18 +529,24 @@ export function asoftclip(pcm: Pcm, range: Range, p: EffectValues): Pcm {
       continue;
     }
 
-    for (let n = 0; n < length; n++) {
-      work[n * oversample] = source[start + n];
-      for (let m = 1; m < oversample; m++) work[n * oversample + m] = 0;
-    }
-
     const up = tdf2State();
-    for (let n = 0; n < work.length; n++) work[n] = runTdf2(antiAlias, work[n], up);
-    for (let n = 0; n < work.length; n++) work[n] = shape(work[n]) * gain;
     const down = tdf2State();
-    for (let n = 0; n < work.length; n++) work[n] = runTdf2(antiAlias, work[n], down);
 
-    for (let n = 0; n < length; n++) target[start + n] = work[n * oversample] * scale;
+    for (let base = start; base < end; base += SOFTCLIP_BLOCK) {
+      const frames = Math.min(SOFTCLIP_BLOCK, end - base);
+      const span = frames * oversample;
+
+      for (let n = 0; n < frames; n++) {
+        work[n * oversample] = source[base + n];
+        for (let m = 1; m < oversample; m++) work[n * oversample + m] = 0;
+      }
+
+      for (let n = 0; n < span; n++) work[n] = runTdf2(antiAlias, work[n], up);
+      for (let n = 0; n < span; n++) work[n] = shape(work[n]) * gain;
+      for (let n = 0; n < span; n++) work[n] = runTdf2(antiAlias, work[n], down);
+
+      for (let n = 0; n < frames; n++) target[base + n] = work[n * oversample] * scale;
+    }
   }
   return out;
 }

@@ -226,6 +226,36 @@ describe('behaviours pinned against a single ffmpeg version', () => {
   });
 
   /**
+   * The oversampled soft-clip path runs in blocks of 8192 input frames so a
+   * long selection cannot allocate its length times the oversampling factor.
+   * That is only equivalent to one pass if the anti-alias filters carry their
+   * state across the boundary, and a reset would show as a step in the output.
+   */
+  it('carries soft-clip filter state across its block boundary', () => {
+    const frames = 8192 * 2 + 500;
+    const pcm = createPcm(1, frames, RATE);
+    for (let i = 0; i < frames; i++) {
+      pcm.channels[0][i] = 0.7 * Math.sin((2 * Math.PI * 180 * i) / RATE);
+    }
+
+    const out = fx.asoftclip(
+      pcm,
+      { start: 0, end: frames },
+      { type: 1, threshold: 0.5, output: 1, param: 1, oversample: 4 },
+    );
+
+    // The step across the boundary must be in line with the steps either side
+    // of it; a reset filter would put a discontinuity there.
+    const stepAt = (i: number): number => Math.abs(out.channels[0][i + 1] - out.channels[0][i]);
+    const boundary = stepAt(8191);
+    const neighbours = [stepAt(8150), stepAt(8180), stepAt(8200), stepAt(8230)];
+    const typical = neighbours.reduce((sum, step) => sum + step, 0) / neighbours.length;
+
+    expect(boundary).toBeLessThan(typical * 3);
+    expect(Number.isFinite(out.channels[0][8192])).toBe(true);
+  });
+
+  /**
    * ffmpeg sizes the tremolo table with `lrint`, which breaks ties to even.
    * 44100/5 + 0.5 is exactly 8820.5, so `Math.round` would give 8821 and the
    * modulation would drift a sample per cycle against the real filter.
