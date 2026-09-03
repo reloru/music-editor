@@ -5,25 +5,26 @@ import { join } from 'node:path';
 import { encodeWav } from '../src/audio/wav';
 import { createPcm } from '../src/audio/pcm';
 
-/** Writes a real stereo WAV to disk for the file picker to pick up. */
-function writeFixture(seconds = 3, sampleRate = 44100): string {
+/** Writes a real WAV to disk for the file picker to pick up. */
+function writeFixture(name: string, channels = 2, seconds = 3, sampleRate = 44100): string {
   const frames = seconds * sampleRate;
-  const pcm = createPcm(2, frames, sampleRate);
+  const pcm = createPcm(channels, frames, sampleRate);
   for (let i = 0; i < frames; i++) {
     const t = i / sampleRate;
     pcm.channels[0][i] = Math.sin(2 * Math.PI * 440 * t) * 0.6;
-    pcm.channels[1][i] = Math.sin(2 * Math.PI * 660 * t) * 0.3;
+    if (channels > 1) pcm.channels[1][i] = Math.sin(2 * Math.PI * 660 * t) * 0.3;
   }
-  const path = join(mkdtempSync(join(tmpdir(), 'editor-')), 'fixture.wav');
+  const path = join(mkdtempSync(join(tmpdir(), 'editor-')), name);
   writeFileSync(path, Buffer.from(encodeWav(pcm, 16)));
   return path;
 }
 
-const FIXTURE = writeFixture();
+const FIXTURE = writeFixture('fixture.wav');
+const MONO_FIXTURE = writeFixture('mono.wav', 1);
 
-async function openFixture(page: Page): Promise<void> {
+async function openFixture(page: Page, file = FIXTURE): Promise<void> {
   await page.goto('/');
-  await page.setInputFiles('#file-input', FIXTURE);
+  await page.setInputFiles('#file-input', file);
   await expect(page.locator('#app')).toHaveAttribute('data-empty', 'false');
   await expect(page.locator('#busy')).toBeHidden();
 }
@@ -249,6 +250,126 @@ test.describe('editor', () => {
     await expect(page.locator('#gain-sheet')).toBeHidden();
     await expect(page.locator('#undo')).toBeEnabled();
     await expect(page.locator('#undo')).toHaveAttribute('title', /Gain/);
+  });
+
+  test('lists every effect and applies one to the track', async ({ page }) => {
+    await openFixture(page);
+    await page.locator('[data-command="effects"]').click();
+
+    const rows = page.locator('#effects-list .effect-list__item');
+    await expect(rows).toHaveCount(16);
+    await expect(page.locator('#effects-scope')).toHaveText('Applies to the whole track.');
+
+    await rows.filter({ hasText: 'Tremolo' }).click();
+    await expect(page.locator('#effect-sheet')).toBeVisible();
+    await expect(page.locator('#effect-title')).toHaveText('Tremolo');
+
+    // Two sliders, from the registry — nothing about tremolo is in the markup.
+    const sliders = page.locator('#effect-controls input[type="range"]');
+    await expect(sliders).toHaveCount(2);
+    await sliders.first().fill('9');
+    await expect(page.locator('#effect-controls .effect-param__value').first()).toHaveText('9.0 Hz');
+
+    await page.locator('#effect-sheet button[value="apply"]').click();
+    await expect(page.locator('#effect-sheet')).toBeHidden();
+    await expect(page.locator('#undo')).toBeEnabled();
+    await expect(page.locator('#undo')).toHaveAttribute('title', 'Undo Tremolo');
+  });
+
+  test('builds segmented controls for choices and toggles', async ({ page }) => {
+    await openFixture(page);
+    await page.locator('[data-command="effects"]').click();
+    await page.locator('.effect-list__item').filter({ hasText: 'Bit crusher' }).click();
+
+    // acrusher has a two-option scale, a sweep toggle, and eight sliders.
+    await expect(page.locator('#effect-controls .segmented')).toHaveCount(2);
+    await expect(page.locator('#effect-controls input[type="range"]')).toHaveCount(9);
+
+    await page.locator('#effect-controls .segmented label').filter({ hasText: 'Logarithmic' }).click();
+    await page.locator('#effect-sheet button[value="apply"]').click();
+    await expect(page.locator('#undo')).toHaveAttribute('title', 'Undo Bit crusher');
+  });
+
+  test('hides the controls a setting makes inert', async ({ page }) => {
+    await openFixture(page);
+    await page.locator('[data-command="effects"]').click();
+    await page.locator('.effect-list__item').filter({ hasText: 'Chorus' }).click();
+
+    const voices = page.locator('#effect-controls [data-param="voices"] input');
+    await expect(page.locator('#effect-controls [data-param="delay2"]')).toBeVisible();
+    await expect(page.locator('#effect-controls [data-param="delay3"]')).toBeHidden();
+
+    await voices.fill('3');
+    await expect(page.locator('#effect-controls [data-param="delay3"]')).toBeVisible();
+    await voices.fill('1');
+    await expect(page.locator('#effect-controls [data-param="delay2"]')).toBeHidden();
+
+    await page.locator('#effect-sheet button[value="cancel"]').click();
+    await page.locator('[data-command="effects"]').click();
+    await page.locator('.effect-list__item').filter({ hasText: 'Bit crusher' }).click();
+
+    // The sweep depth and rate only exist while the sweep is on.
+    await expect(page.locator('#effect-controls [data-param="lfoRate"]')).toBeHidden();
+    await page.locator('#effect-controls [data-param="lfo"] label').filter({ hasText: 'On' }).click();
+    await expect(page.locator('#effect-controls [data-param="lfoRate"]')).toBeVisible();
+  });
+
+  test('keeps per-effect settings while the track is open', async ({ page }) => {
+    await openFixture(page);
+
+    await page.locator('[data-command="effects"]').click();
+    await page.locator('.effect-list__item').filter({ hasText: 'Tremolo' }).click();
+    await page.locator('#effect-controls input[type="range"]').first().fill('12');
+    await page.locator('#effect-sheet button[value="cancel"]').click();
+
+    await page.locator('[data-command="effects"]').click();
+    await page.locator('.effect-list__item').filter({ hasText: 'Tremolo' }).click();
+    await expect(page.locator('#effect-controls input[type="range"]').first()).toHaveValue('12');
+
+    await page.locator('#effect-reset').click();
+    await expect(page.locator('#effect-controls input[type="range"]').first()).toHaveValue('5');
+  });
+
+  test('disables the stereo-only effects on a mono track', async ({ page }) => {
+    await openFixture(page, MONO_FIXTURE);
+    await expect(page.locator('#track-meta')).toContainText('Mono');
+
+    await page.locator('[data-command="effects"]').click();
+    const haas = page.locator('.effect-list__item').filter({ hasText: 'Haas' });
+    await expect(haas).toBeDisabled();
+    await expect(haas).toContainText('Needs a stereo track.');
+    await expect(page.locator('.effect-list__item').filter({ hasText: 'Tremolo' })).toBeEnabled();
+  });
+
+  test('applies an effect to the selection only', async ({ page }) => {
+    await openFixture(page);
+    await selectMiddle(page);
+
+    await page.locator('[data-command="effects"]').click();
+    await expect(page.locator('#effects-scope')).toHaveText('Applies to the selection.');
+    await page.locator('.effect-list__item').filter({ hasText: 'Telephone' }).click();
+    await page.locator('#effect-sheet button[value="apply"]').click();
+
+    // The edit is recorded but the length is not, since no effect resamples.
+    await expect(page.locator('#undo')).toHaveAttribute('title', 'Undo Telephone');
+    await expect(page.locator('#readout-duration')).toHaveText('0:03.00');
+  });
+
+  test('previews an effect without changing the track', async ({ page }) => {
+    await openFixture(page);
+    await page.locator('[data-command="effects"]').click();
+    await page.locator('.effect-list__item').filter({ hasText: 'Echo' }).click();
+
+    const preview = page.locator('#effect-preview');
+    await preview.click();
+    await expect(preview).toHaveText('Stop preview');
+    await preview.click();
+    await expect(preview).toHaveText('Preview');
+
+    // A preview is not an edit.
+    await expect(page.locator('#undo')).toBeDisabled();
+    await page.locator('#effect-sheet button[value="cancel"]').click();
+    await expect(page.locator('#undo')).toBeDisabled();
   });
 
   test('runs a full edit and export without a console error', async ({ page }) => {

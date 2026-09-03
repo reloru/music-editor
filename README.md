@@ -27,6 +27,13 @@ other at the nearest end of the track.
 clipping markers, and a peak pyramid behind it so a five-minute track redraws at
 60 fps instead of rescanning 26 million samples per frame.
 
+**Effects** — sixteen of them, each ported from the ffmpeg filter it is named
+after and each with its own controls: bass shelf, crystalizer, exciter, sub
+boost and a telephone band; bit crusher and soft clip; echo, phaser, chorus,
+flanger, tremolo and pulsator; Haas, stereo widen and crossfeed. Preview renders
+the first eight seconds of the selection and plays it, through the same code
+Apply writes with, so what you hear is what you get.
+
 **Export** — MP3 at 128/192/256/320 kbps (encoded in a Web Worker so the UI stays
 live) or WAV at 16-bit, 24-bit or 32-bit float. Export the whole track or just
 the selection, then hand it to the iOS share sheet, download it, or turn it into
@@ -143,6 +150,9 @@ src/ui/app.ts         binds DOM controls to editor commands
 src/ui/waveform.ts    canvas rendering and every touch gesture
 src/audio/pcm.ts      the in-memory audio type and helpers
 src/audio/dsp.ts      every destructive edit, as pure functions
+src/audio/effects.ts  the ffmpeg filter ports, same shape as dsp.ts
+src/audio/effect-registry.ts  each effect's controls; the sheet builds itself from it
+src/audio/biquad.ts   biquad design and evaluation, shared by the effects
 src/audio/wav.ts      WAV writing, and reading for formats Safari refuses
 src/audio/peaks.ts    the min/max/RMS pyramid the waveform draws from
 src/audio/engine.ts   playback, and the iOS audio-session handling
@@ -165,8 +175,8 @@ full scale, and clamping happens once, at export.
 ## Testing
 
 ```bash
-npm test          # 134 unit tests
-npm run test:e2e  # 14 end-to-end tests in a real browser
+npm test          # 253 unit tests
+npm run test:e2e  # 24 end-to-end tests in a real browser
 ```
 
 The end-to-end suite drives the built app in Chromium at 430 × 932 with touch
@@ -180,6 +190,33 @@ Point it at the real Worker — CSP headers and all — with:
 npm run build && npm run cf:dev          # in one terminal
 E2E_BASE_URL=http://127.0.0.1:8787 npm run test:e2e
 ```
+
+### Effects, checked against ffmpeg
+
+Reading a filter's source and rewriting it is not proof that the rewrite is the
+same filter, so `test/effects-ffmpeg.test.ts` runs the real one. It pipes the
+same samples through `ffmpeg -af <filter>` with the same options and compares
+the output sample for sample, across every effect's defaults and 32 further
+settings covering the modes, curves and branches the defaults never reach.
+
+Install ffmpeg and it runs; without it on `PATH` the suite skips itself, so CI
+stays green and `test/effects.test.ts` carries the rest. `EFFECT_DIFF=1` prints
+the measured divergence per case.
+
+```bash
+EFFECT_DIFF=1 npx vitest run test/effects-ffmpeg.test.ts
+```
+
+Most come back bit-identical; the worst case is 1.1 × 10⁻⁶, which is float32
+rounding on both sides. It has already earned its keep — it caught a table
+sized with `Math.round` where ffmpeg uses `lrint` (a sample of drift per cycle
+in tremolo), and a missing branch for negative crystalizer intensities, where
+ffmpeg dispatches on the sign to an inverse recursion that feeds its own output
+back rather than the input. Neither was visible in a reading of the source.
+
+Where a chain in that file names `precision=f64`, it is because ffmpeg's biquads
+pick their working precision from the input format; matching it makes the
+comparison bit-exact rather than merely close.
 
 ### Touch, layout and drag harnesses
 

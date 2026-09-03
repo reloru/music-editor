@@ -610,6 +610,125 @@ body {
   padding: 20px 20px calc(20px + var(--safe-bottom));
 }
 
+/*
+ * An effect can have fifteen controls, which is taller than any phone. The cap
+ * is on the dialog and the body inherits it, so the body is the scroll
+ * container and the sticky action block below stays on screen while the
+ * parameters move under it.
+ */
+.sheet {
+  max-height: 88dvh;
+}
+
+.sheet__body--scroll {
+  max-height: inherit;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.sheet__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sheet__header .button {
+  flex: 0 0 auto;
+  padding: 0 10px;
+  font-size: 14px;
+}
+
+/* ----------------------------------------------------------------- effects */
+
+.effect-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.effect-list__item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-height: var(--tap);
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.effect-list__item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.effect-list__item:not(:disabled):active {
+  border-color: var(--accent);
+}
+
+.effect-list__name {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.effect-list__hint {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.effect-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.effect-param {
+  display: flex;
+  flex-direction: column;
+}
+
+.effect-param__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.effect-param__label {
+  font-size: 14px;
+}
+
+.effect-param__value {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+/*
+ * Sticky rather than pinned outside the scroll area, so Apply is always
+ * reachable without scrolling to the end of a long parameter list. The
+ * background is opaque because the parameters slide underneath it.
+ */
+.effect-actions {
+  position: sticky;
+  bottom: calc(-20px - var(--safe-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+  padding-block: 10px calc(10px + var(--safe-bottom));
+  background: var(--surface);
+}
+
 .sheet__title {
   margin: 0;
   font-size: 20px;

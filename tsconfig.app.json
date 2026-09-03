@@ -17,5 +17,6 @@
     "resolveJsonModule": true,
     "noEmit": true
   },
-  "include": ["src", "test"]
+  "include": ["src", "test"],
+  "exclude": ["test/effects-ffmpeg.test.ts"]
 }

@@ -146,6 +146,7 @@
         <button class="tool" type="button" data-command="normalize">Normalise</button>
         <button class="tool" type="button" data-command="gain">Gain…</button>
         <button class="tool" type="button" data-command="speed">Speed…</button>
+        <button class="tool" type="button" data-command="effects">Effects…</button>
         <button class="tool" type="button" data-command="reverse">Reverse</button>
         <button class="tool" type="button" data-command="dc-offset">Fix DC</button>
       </nav>
@@ -179,6 +180,42 @@
         <div class="sheet__actions">
           <button class="button button--ghost" value="cancel" type="submit">Cancel</button>
           <button class="button button--primary" value="apply" type="submit">Apply</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!--
+      Both effect sheets are empty in the markup: the list and every control in
+      it are built from the table in `effect-registry.ts`, so the UI layer never
+      names an individual effect or parameter.
+    -->
+    <dialog id="effects-sheet" class="sheet">
+      <form method="dialog" class="sheet__body sheet__body--scroll">
+        <h2 class="sheet__title">Effects</h2>
+        <p class="sheet__hint" id="effects-scope"></p>
+        <div id="effects-list" class="effect-list"></div>
+        <div class="effect-actions">
+          <button class="button button--quiet button--wide" value="cancel" type="submit">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="effect-sheet" class="sheet">
+      <form method="dialog" class="sheet__body sheet__body--scroll">
+        <div class="sheet__header">
+          <h2 class="sheet__title" id="effect-title">Effect</h2>
+          <button class="button button--quiet" id="effect-reset" type="button">Reset</button>
+        </div>
+        <p class="sheet__hint" id="effect-hint"></p>
+        <div id="effect-controls" class="effect-controls"></div>
+        <div class="effect-actions">
+          <button class="button button--ghost button--wide" id="effect-preview" type="button">
+            Preview
+          </button>
+          <div class="sheet__actions">
+            <button class="button button--quiet" value="cancel" type="submit">Cancel</button>
+            <button class="button button--primary" value="apply" type="submit">Apply</button>
+          </div>
         </div>
       </form>
     </dialog>

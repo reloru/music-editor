@@ -14,5 +14,5 @@
     "checkJs": false,
     "noEmit": true
   },
-  "include": ["e2e", "scripts", "vite.config.ts", "playwright.config.ts"]
+  "include": ["e2e", "scripts", "test/effects-ffmpeg.test.ts", "vite.config.ts", "playwright.config.ts"]
 }

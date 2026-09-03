@@ -9,6 +9,8 @@
 import { AudioEngine } from './audio/engine';
 import { decodeAudioFile } from './audio/decode';
 import * as dsp from './audio/dsp';
+import type { EffectSpec } from './audio/effect-registry';
+import type { EffectValues } from './audio/effects';
 import { changeSpeed } from './audio/offline';
 import { buildPeaks, type PeakPyramid } from './audio/peaks';
 import {
@@ -458,6 +460,49 @@ export class Editor {
       return dsp.replaceRange(pcm, selection, stretched);
     });
     this.selection = null;
+  }
+
+  /** Runs one of the registry's effects over the selection, or the whole track. */
+  async applyEffect(spec: EffectSpec, values: EffectValues): Promise<void> {
+    if (!this.pcm) return;
+    if (spec.stereoOnly && this.channels !== 2) {
+      this.warn(`${spec.label} needs a stereo track.`);
+      return;
+    }
+    const range = this.effectiveRange;
+    await this.applyEdit(spec.label, (pcm) => spec.apply(pcm, range, values));
+  }
+
+  /**
+   * Renders the first `seconds` of the current range through `spec` and plays
+   * it, without touching the document.
+   *
+   * The window is sliced out first and the effect run over the whole slice,
+   * rather than run over a sub-range of the full buffer. The two are sample-
+   * identical here — every effect starts its filter state cold at the beginning
+   * of the range either way — and slicing first is what keeps a preview on a
+   * five-minute track from allocating a copy of the whole thing.
+   */
+  async previewEffect(spec: EffectSpec, values: EffectValues, seconds = 8): Promise<void> {
+    if (!this.pcm) return;
+    if (spec.stereoOnly && this.channels !== 2) {
+      this.warn(`${spec.label} needs a stereo track.`);
+      return;
+    }
+    const range = this.effectiveRange;
+    const window = {
+      start: range.start,
+      end: Math.min(range.end, range.start + Math.round(seconds * this.sampleRate)),
+    };
+    if (window.end <= window.start) return;
+
+    const clip = dsp.slice(this.pcm, window);
+    const rendered = spec.apply(clip, { start: 0, end: frameCount(clip) }, values);
+    await this.engine.playPreview(rendered);
+  }
+
+  stopPreview(): void {
+    this.engine.stopPreview();
   }
 
   // ------------------------------------------------------------ undo and redo
