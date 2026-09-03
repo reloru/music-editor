@@ -33,7 +33,12 @@ export class AudioEngine {
   private state: EngineState = 'stopped';
   private pausedAt = 0;
 
+  /** A one-shot audition source; see `playPreview`. */
+  private preview: AudioBufferSourceNode | null = null;
+
   onStateChange: ((state: EngineState) => void) | null = null;
+  /** Fires when a preview reaches its end on its own. */
+  onPreviewEnd: (() => void) | null = null;
 
   /**
    * The AudioContext, created on first use and left in whatever state it is in.
@@ -179,6 +184,51 @@ export class AudioEngine {
     this.startedAt = ctx.currentTime;
     this.startOffset = from;
     this.setState('playing');
+  }
+
+  /**
+   * Plays a standalone buffer once, outside the transport.
+   *
+   * Used to audition an effect before it is written to the document. It stops
+   * the transport first rather than mixing with it — hearing the dry track
+   * under the wet preview would defeat the point — and it leaves the playhead,
+   * the loop region and the engine's own state untouched, so the transport
+   * carries on from where it was afterwards.
+   */
+  async playPreview(pcm: Pcm): Promise<void> {
+    const ctx = await this.ensureContext();
+    if (!this.gain) return;
+    this.pause();
+    this.stopPreview();
+
+    const source = ctx.createBufferSource();
+    source.buffer = toAudioBuffer(pcm, ctx);
+    source.connect(this.gain);
+    source.onended = () => {
+      if (this.preview === source) {
+        this.preview = null;
+        this.onPreviewEnd?.();
+      }
+    };
+    this.preview = source;
+    source.start(0);
+  }
+
+  stopPreview(): void {
+    const source = this.preview;
+    if (!source) return;
+    this.preview = null;
+    source.onended = null;
+    try {
+      source.stop();
+    } catch {
+      // Already stopped; nothing to do.
+    }
+    source.disconnect();
+  }
+
+  get isPreviewing(): boolean {
+    return this.preview != null;
   }
 
   /** Stops and leaves the playhead where it landed. */

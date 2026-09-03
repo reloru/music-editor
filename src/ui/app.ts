@@ -8,9 +8,14 @@ import { Editor, formatDuration, parseTimecode } from '../editor';
 import { WaveformView } from './waveform';
 import { exportAudio, type ExportFormat } from '../audio/export';
 import { slice } from '../audio/dsp';
+import { EFFECTS, formatParam, type EffectSpec, type ParamSpec } from '../audio/effect-registry';
+import type { EffectValues } from '../audio/effects';
 import type { Pcm } from '../audio/pcm';
 import type { WavBitDepth } from '../audio/wav';
 import { clearSnapshot, loadSnapshot, saveSnapshot } from '../storage/session';
+
+/** How much of the selection an effect preview renders and plays. */
+const PREVIEW_SECONDS = 8;
 
 interface ServerConfig {
   sharing: boolean;
@@ -26,6 +31,10 @@ export class App {
   private toastTimer = 0;
   private animation = 0;
   private lastNotice: string | null = null;
+  /** The effect whose parameter sheet is open, if any. */
+  private activeEffect: EffectSpec | null = null;
+  /** Per-effect settings, kept for the session so reopening resumes where you left off. */
+  private readonly effectValues = new Map<string, EffectValues>();
 
   constructor() {
     this.waveform = new WaveformView(this.elements.canvas, this.editor);
@@ -37,6 +46,7 @@ export class App {
     this.bindTools();
     this.bindReadout();
     this.bindSheets();
+    this.bindEffects();
     this.bindKeyboard();
     this.bindLifecycle();
     this.bindAudioUnlock();
@@ -148,6 +158,9 @@ export class App {
         break;
       case 'speed':
         this.openSpeedSheet();
+        break;
+      case 'effects':
+        this.openEffectsSheet();
         break;
       case 'export':
         this.openExportSheet();
@@ -399,6 +412,213 @@ export class App {
     this.elements.speedSlider.value = '1';
     this.elements.speedValue.textContent = '1.00×';
     this.elements.speedSheet.showModal();
+  }
+
+  // ------------------------------------------------------------------ effects
+
+  private bindEffects(): void {
+    const { effectsList, effectSheet, effectPreview, effectReset } = this.elements;
+
+    // One row per registry entry, built once. Availability is re-evaluated
+    // every time the list opens, since it depends on the loaded track.
+    for (const spec of EFFECTS) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'effect-list__item';
+      row.dataset.effect = spec.id;
+
+      const name = document.createElement('span');
+      name.className = 'effect-list__name';
+      name.textContent = spec.label;
+      const hint = document.createElement('span');
+      hint.className = 'effect-list__hint';
+      hint.textContent = spec.hint;
+      row.append(name, hint);
+
+      row.addEventListener('click', () => {
+        this.elements.effectsSheet.close('picked');
+        this.openEffectSheet(spec);
+      });
+      effectsList.append(row);
+    }
+
+    effectPreview.addEventListener('click', () => void this.toggleEffectPreview());
+    effectReset.addEventListener('click', () => {
+      if (!this.activeEffect) return;
+      this.effectValues.delete(this.activeEffect.id);
+      this.renderEffectControls(this.activeEffect);
+    });
+
+    effectSheet.addEventListener('close', () => {
+      this.editor.stopPreview();
+      const spec = this.activeEffect;
+      this.activeEffect = null;
+      if (spec && effectSheet.returnValue === 'apply') {
+        void this.editor.applyEffect(spec, this.valuesFor(spec));
+      }
+    });
+
+    this.editor.engine.onPreviewEnd = () => this.syncPreviewButton();
+  }
+
+  private openEffectsSheet(): void {
+    if (!this.editor.hasAudio) return;
+    const stereo = this.editor.channels === 2;
+
+    this.elements.effectsScope.textContent = this.editor.hasSelection
+      ? 'Applies to the selection.'
+      : 'Applies to the whole track.';
+
+    for (const row of this.elements.effectsList.querySelectorAll<HTMLButtonElement>('[data-effect]')) {
+      const spec = EFFECTS.find((entry) => entry.id === row.dataset.effect);
+      const blocked = Boolean(spec?.stereoOnly) && !stereo;
+      row.disabled = blocked;
+      const hint = row.querySelector('.effect-list__hint');
+      if (hint && spec) hint.textContent = blocked ? 'Needs a stereo track.' : spec.hint;
+    }
+
+    this.elements.effectsSheet.showModal();
+  }
+
+  private openEffectSheet(spec: EffectSpec): void {
+    this.activeEffect = spec;
+    this.elements.effectTitle.textContent = spec.label;
+    this.elements.effectHint.textContent = spec.hint;
+    this.renderEffectControls(spec);
+    this.syncPreviewButton();
+    this.elements.effectSheet.showModal();
+  }
+
+  /** The working values for `spec`: what was last dialled in, or its defaults. */
+  private valuesFor(spec: EffectSpec): EffectValues {
+    return this.effectValues.get(spec.id) ?? spec.defaults;
+  }
+
+  private setValue(spec: EffectSpec, key: string, value: number): void {
+    this.effectValues.set(spec.id, { ...this.valuesFor(spec), [key]: value });
+    this.syncParamVisibility(spec);
+  }
+
+  private renderEffectControls(spec: EffectSpec): void {
+    const host = this.elements.effectControls;
+    host.textContent = '';
+    const values = this.valuesFor(spec);
+    for (const param of spec.params) {
+      host.append(this.buildParamControl(spec, param, values[param.key]));
+    }
+    this.syncParamVisibility(spec);
+  }
+
+  /**
+   * Shows or hides the controls a setting makes inert.
+   *
+   * Toggling `hidden` rather than re-rendering, because this runs on every
+   * `input` event: rebuilding the list would tear out the slider under the
+   * finger that is moving it.
+   */
+  private syncParamVisibility(spec: EffectSpec): void {
+    const values = this.valuesFor(spec);
+    for (const param of spec.params) {
+      if (!param.visibleWhen) continue;
+      const control = this.elements.effectControls.querySelector<HTMLElement>(
+        `[data-param="${param.key}"]`,
+      );
+      if (control) control.hidden = !param.visibleWhen(values);
+    }
+  }
+
+  private buildParamControl(spec: EffectSpec, param: ParamSpec, value: number): HTMLElement {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'effect-param';
+    wrapper.dataset.param = param.key;
+
+    if (param.kind === 'slider') {
+      const head = document.createElement('div');
+      head.className = 'effect-param__head';
+      const label = document.createElement('label');
+      label.className = 'effect-param__label';
+      label.htmlFor = `param-${spec.id}-${param.key}`;
+      label.textContent = param.label;
+      const readout = document.createElement('output');
+      readout.className = 'effect-param__value';
+      readout.textContent = formatParam(param, value);
+      head.append(label, readout);
+
+      const input = document.createElement('input');
+      input.id = label.htmlFor;
+      input.className = 'slider';
+      input.type = 'range';
+      input.min = String(param.min);
+      input.max = String(param.max);
+      input.step = String(param.step);
+      input.value = String(value);
+      input.addEventListener('input', () => {
+        const next = Number(input.value);
+        readout.textContent = formatParam(param, next);
+        this.setValue(spec, param.key, next);
+      });
+
+      wrapper.append(head, input);
+      return wrapper;
+    }
+
+    // Toggles and choices are both a segmented control; a toggle is the
+    // two-option case, which keeps one styling path instead of two.
+    const options = param.kind === 'toggle' ? ['Off', 'On'] : param.options;
+    const fieldset = document.createElement('fieldset');
+    fieldset.className = 'segmented';
+    const legend = document.createElement('legend');
+    legend.className = 'sheet__label';
+    legend.textContent = param.label;
+    fieldset.append(legend);
+
+    options.forEach((option, index) => {
+      const label = document.createElement('label');
+      const input = document.createElement('input');
+      input.type = 'radio';
+      input.name = `param-${spec.id}-${param.key}`;
+      input.value = String(index);
+      input.checked = Math.round(value) === index;
+      input.addEventListener('change', () => {
+        if (input.checked) this.setValue(spec, param.key, index);
+      });
+      const text = document.createElement('span');
+      text.textContent = option;
+      label.append(input, text);
+      fieldset.append(label);
+    });
+
+    wrapper.append(fieldset);
+    return wrapper;
+  }
+
+  private async toggleEffectPreview(): Promise<void> {
+    const spec = this.activeEffect;
+    if (!spec) return;
+
+    if (this.editor.engine.isPreviewing) {
+      this.editor.stopPreview();
+      this.syncPreviewButton();
+      return;
+    }
+
+    // The busy overlay lives under the modal, so the button itself has to say
+    // that work is happening.
+    this.elements.effectPreview.disabled = true;
+    this.elements.effectPreview.textContent = 'Rendering…';
+    try {
+      await this.editor.previewEffect(spec, this.valuesFor(spec), PREVIEW_SECONDS);
+    } catch (error) {
+      this.showToast(error instanceof Error ? error.message : String(error), 'error');
+    } finally {
+      this.elements.effectPreview.disabled = false;
+      this.syncPreviewButton();
+    }
+  }
+
+  private syncPreviewButton(): void {
+    const playing = this.editor.engine.isPreviewing;
+    setText(this.elements.effectPreview, playing ? 'Stop preview' : 'Preview');
   }
 
   private openExportSheet(): void {
@@ -734,6 +954,15 @@ function queryElements() {
     speedSheet: need<HTMLDialogElement>('#speed-sheet'),
     speedSlider: need<HTMLInputElement>('#speed-slider'),
     speedValue: need<HTMLElement>('#speed-value'),
+    effectsSheet: need<HTMLDialogElement>('#effects-sheet'),
+    effectsList: need<HTMLElement>('#effects-list'),
+    effectsScope: need<HTMLElement>('#effects-scope'),
+    effectSheet: need<HTMLDialogElement>('#effect-sheet'),
+    effectTitle: need<HTMLElement>('#effect-title'),
+    effectHint: need<HTMLElement>('#effect-hint'),
+    effectControls: need<HTMLElement>('#effect-controls'),
+    effectPreview: need<HTMLButtonElement>('#effect-preview'),
+    effectReset: need<HTMLButtonElement>('#effect-reset'),
     exportSheet: need<HTMLDialogElement>('#export-sheet'),
     exportFormat: need<HTMLElement>('#export-format'),
     exportBitrate: need<HTMLElement>('#export-bitrate'),
