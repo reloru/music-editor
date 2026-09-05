@@ -506,7 +506,7 @@ export class Editor {
     const clip = dsp.slice(this.pcm, { start: sliceStart, end: sliceEnd });
 
     const effectRange = { start: range.start - sliceStart, end: previewEnd - sliceStart };
-    const rendered = spec.apply(clip, effectRange, values);
+    const rendered = await spec.apply(clip, effectRange, values);
     const trimmed = context > 0 ? dsp.slice(rendered, effectRange) : rendered;
     await this.engine.playPreview(trimmed);
   }

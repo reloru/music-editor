@@ -87,8 +87,14 @@ describe('every effect', () => {
   const whole = { start: 0, end: frameCount(stereo) };
 
   for (const effect of EFFECTS) {
-    it(`${effect.id} keeps the buffer's shape and produces finite samples`, () => {
-      const out = effect.apply(stereo, whole, effect.defaults);
+    // `await` throughout this describe block, not just where declick is
+    // reached: `effect.apply` returns `Pcm | Promise<Pcm>` because declick's
+    // own reconstruction yields periodically (see the comment on `declick` in
+    // effects.ts) rather than blocking the thread for as long as a long
+    // track takes, and `await` on a plain, already-synchronous `Pcm` result
+    // resolves immediately, so every other effect here is unaffected.
+    it(`${effect.id} keeps the buffer's shape and produces finite samples`, async () => {
+      const out = await effect.apply(stereo, whole, effect.defaults);
       expect(channelCount(out)).toBe(channelCount(stereo));
       expect(frameCount(out)).toBe(frameCount(stereo));
       expect(out.sampleRate).toBe(stereo.sampleRate);
@@ -99,19 +105,19 @@ describe('every effect', () => {
       }
     });
 
-    it(`${effect.id} does not mutate its input`, () => {
+    it(`${effect.id} does not mutate its input`, async () => {
       const source = fixture();
       const before = source.channels.map((channel) => Float32Array.from(channel));
-      effect.apply(source, whole, effect.defaults);
+      await effect.apply(source, whole, effect.defaults);
       for (let c = 0; c < before.length; c++) {
         expect(Array.from(source.channels[c])).toEqual(Array.from(before[c]));
       }
     });
 
-    it(`${effect.id} touches nothing outside the range`, () => {
+    it(`${effect.id} touches nothing outside the range`, async () => {
       const source = fixture();
       const range = { start: 2000, end: 5000 };
-      const out = effect.apply(source, range, effect.defaults);
+      const out = await effect.apply(source, range, effect.defaults);
 
       for (let c = 0; c < out.channels.length; c++) {
         for (let i = 0; i < range.start; i++) {
@@ -124,7 +130,7 @@ describe('every effect', () => {
     });
   }
 
-  it('changes something inside the range', () => {
+  it('changes something inside the range', async () => {
     // A no-op at its defaults would pass every check above, so assert the
     // opposite too: each effect audibly does something out of the box.
     //
@@ -133,7 +139,7 @@ describe('every effect', () => {
     // artefact — is the only honest default, the same way the Gain sheet
     // defaults to 0 dB. Every other effect is expected to do something.
     for (const effect of EFFECTS.filter((entry) => entry.id !== 'equalizer')) {
-      const out = effect.apply(stereo, whole, effect.defaults);
+      const out = await effect.apply(stereo, whole, effect.defaults);
       let changed = false;
       for (let c = 0; c < out.channels.length && !changed; c++) {
         for (let i = 0; i < frameCount(out); i++) {
@@ -152,11 +158,11 @@ describe('every effect', () => {
     expect(stereoOnly.sort()).toEqual(['apulsator', 'crossfeed', 'haas', 'stereowiden']);
   });
 
-  it('runs the mono-safe effects on a mono track', () => {
+  it('runs the mono-safe effects on a mono track', async () => {
     const mono = fixture(4000, 1);
     const range = { start: 0, end: frameCount(mono) };
     for (const effect of EFFECTS.filter((entry) => !entry.stereoOnly)) {
-      const out = effect.apply(mono, range, effect.defaults);
+      const out = await effect.apply(mono, range, effect.defaults);
       expect(channelCount(out), `${effect.id} on mono`).toBe(1);
       expect(frameCount(out), `${effect.id} on mono`).toBe(frameCount(mono));
     }
@@ -294,7 +300,7 @@ describe('declick, gate and equalizer', () => {
    * fill it in from that model, landing close to where the untouched sine
    * would have been.
    */
-  it('removes an injected click from an otherwise smooth tone', () => {
+  it('removes an injected click from an otherwise smooth tone', async () => {
     const frames = 8000;
     const pcm = createPcm(1, frames, RATE);
     for (let i = 0; i < frames; i++) pcm.channels[0][i] = 0.4 * Math.sin((2 * Math.PI * 300 * i) / RATE);
@@ -302,7 +308,7 @@ describe('declick, gate and equalizer', () => {
     pcm.channels[0][4000] = 0.95;
 
     const declickSpec = findEffect('declick')!;
-    const out = declickSpec.apply(pcm, { start: 0, end: frames }, declickSpec.defaults);
+    const out = await declickSpec.apply(pcm, { start: 0, end: frames }, declickSpec.defaults);
 
     const rawError = Math.abs(0.95 - trueValue);
     const repairedError = Math.abs(out.channels[0][4000] - trueValue);
@@ -314,13 +320,13 @@ describe('declick, gate and equalizer', () => {
    * reconstruction is inherently a ramp, by design, see `effects.ts` — a
    * click-free tone should come back close to what went in.
    */
-  it('leaves a click-free tone close to unchanged, away from the true edges', () => {
+  it('leaves a click-free tone close to unchanged, away from the true edges', async () => {
     const frames = 20000;
     const pcm = createPcm(1, frames, RATE);
     for (let i = 0; i < frames; i++) pcm.channels[0][i] = 0.3 * Math.sin((2 * Math.PI * 440 * i) / RATE);
 
     const declickSpec = findEffect('declick')!;
-    const out = declickSpec.apply(pcm, { start: 0, end: frames }, declickSpec.defaults);
+    const out = await declickSpec.apply(pcm, { start: 0, end: frames }, declickSpec.defaults);
 
     let worst = 0;
     for (let i = 5000; i < 15000; i++) worst = Math.max(worst, Math.abs(out.channels[0][i] - pcm.channels[0][i]));
@@ -348,7 +354,7 @@ describe('declick, gate and equalizer', () => {
    * before and after the fix in this file; only cross-fade's true-edge
    * behaviour was ever wrong, which is what the ffmpeg-backed test now pins.
    */
-  it('repairs a click close to the true start of the buffer under overlap-save', () => {
+  it('repairs a click close to the true start of the buffer under overlap-save', async () => {
     const frames = 8000;
     const pcm = createPcm(1, frames, RATE);
     for (let i = 0; i < frames; i++) pcm.channels[0][i] = 0.4 * Math.sin((2 * Math.PI * 300 * i) / RATE);
@@ -356,12 +362,12 @@ describe('declick, gate and equalizer', () => {
     pcm.channels[0][50] = -0.95;
 
     const declickSpec = findEffect('declick')!;
-    const out = declickSpec.apply(pcm, { start: 0, end: frames }, { ...declickSpec.defaults, method: 1 });
+    const out = await declickSpec.apply(pcm, { start: 0, end: frames }, { ...declickSpec.defaults, method: 1 });
 
     expect(Math.abs(out.channels[0][50] - trueValue)).toBeLessThan(0.01);
   });
 
-  it('quiets a section below its threshold and leaves a loud one alone', () => {
+  it('quiets a section below its threshold and leaves a loud one alone', async () => {
     const frames = 30000;
     const pcm = createPcm(1, frames, RATE);
     for (let i = 0; i < frames; i++) {
@@ -372,7 +378,7 @@ describe('declick, gate and equalizer', () => {
     }
 
     const gateSpec = findEffect('agate')!;
-    const out = gateSpec.apply(pcm, { start: 0, end: frames }, gateSpec.defaults);
+    const out = await gateSpec.apply(pcm, { start: 0, end: frames }, gateSpec.defaults);
 
     const peak = (from: number, to: number): number => {
       let value = 0;
@@ -384,7 +390,7 @@ describe('declick, gate and equalizer', () => {
     expect(peak(frames - 2000, frames - 500), 'gated quiet section').toBeLessThan(0.02);
   });
 
-  it('boosts energy at the target frequency and cuts it in the opposite direction', () => {
+  it('boosts energy at the target frequency and cuts it in the opposite direction', async () => {
     const frames = 8192;
     const pcm = createPcm(1, frames, RATE);
     for (let i = 0; i < frames; i++) pcm.channels[0][i] = 0.2 * Math.sin((2 * Math.PI * 1000 * i) / RATE);
@@ -397,8 +403,8 @@ describe('declick, gate and equalizer', () => {
 
     const equalizerSpec = findEffect('equalizer')!;
     const source = energy(pcm.channels[0]);
-    const boosted = equalizerSpec.apply(pcm, { start: 0, end: frames }, { frequency: 1000, width: 1, gain: 12 });
-    const cut = equalizerSpec.apply(pcm, { start: 0, end: frames }, { frequency: 1000, width: 1, gain: -12 });
+    const boosted = await equalizerSpec.apply(pcm, { start: 0, end: frames }, { frequency: 1000, width: 1, gain: 12 });
+    const cut = await equalizerSpec.apply(pcm, { start: 0, end: frames }, { frequency: 1000, width: 1, gain: -12 });
 
     expect(energy(boosted.channels[0])).toBeGreaterThan(source * 2);
     expect(energy(cut.channels[0])).toBeLessThan(source * 0.5);

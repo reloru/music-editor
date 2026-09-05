@@ -50,7 +50,7 @@ export interface EffectSpec {
   stereoOnly?: boolean;
   params: ParamSpec[];
   defaults: EffectValues;
-  apply(pcm: Pcm, range: Range, values: EffectValues): Pcm;
+  apply(pcm: Pcm, range: Range, values: EffectValues): Pcm | Promise<Pcm>;
   /**
    * How many samples outside its range this effect reads (never writes) for
    * context — currently only `declick`, which needs real audio around a
