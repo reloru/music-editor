@@ -21,7 +21,11 @@
  *   an IIR applied to part of a track has nothing to prime itself with, so the
  *   first few milliseconds ramp up from silence, and the tail that would have
  *   continued past the end of the selection is not written. That is inherent to
- *   a range-limited edit, not a defect in the port.
+ *   a range-limited edit, not a defect in the port. `declick` is the one
+ *   exception, noted where it happens: it reads real audio outside the range
+ *   for context (never writes there), because its window needs to reach full
+ *   overlap coverage before the selection starts, and ffmpeg's own default
+ *   reconstruction fades in over exactly that span if it cannot.
  *
  * Like everything in `dsp.ts`, each function takes a `Pcm` and returns a new
  * one without mutating its input.
@@ -33,11 +37,12 @@ import {
   lowPassSlope,
   lowShelf,
   normalizeDcGain,
+  peakingEq,
   runDf1,
   runTdf2,
   tdf2State,
 } from './biquad';
-import { type Pcm, type Range, clampRange, clonePcm } from './pcm';
+import { type Pcm, type Range, clampRange, clonePcm, frameCount } from './pcm';
 
 /** ffmpeg designs every plain highpass and lowpass in these filters at Q = 0.707. */
 const RBJ_Q = 0.707;
@@ -1098,4 +1103,480 @@ export function telephone(pcm: Pcm, range: Range, p: EffectValues): Pcm {
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------- equalizer
+
+/**
+ * `equalizer` — libavfilter/af_biquads.c, the `equalizer` case.
+ *
+ * A single peaking band, direct form I (ffmpeg's default transform for this
+ * filter). Built for one purpose here: a comb-filtered "hollow pipe" artifact
+ * from source separation is a narrow resonance, and there is no reliable way
+ * to find and cancel it automatically — the delay and phase behind a comb are
+ * unknown per instance. This lets it be found and pulled down by ear instead.
+ *
+ * ffmpeg's own default frequency is 0 Hz, which — paired with the default
+ * gain of 0 dB — is a true no-op filter and not a useful starting point in a
+ * UI with a Preview button. The registry default here is 1 kHz instead, a
+ * frequency judgment call rather than one read off the filter, since nothing
+ * in ffmpeg's own defaults is usable as a starting point.
+ */
+export function equalizer(pcm: Pcm, range: Range, p: EffectValues): Pcm {
+  const { out, start, end } = prepare(pcm, range);
+  const filter = peakingEq(pcm.sampleRate, p.frequency, p.gain, p.width);
+
+  for (let c = 0; c < pcm.channels.length; c++) {
+    const source = pcm.channels[c];
+    const target = out.channels[c];
+    const state = df1State();
+    for (let i = start; i < end; i++) target[i] = runDf1(filter, source[i], state);
+  }
+  return out;
+}
+
+// --------------------------------------------------------------------- gate
+
+/**
+ * `agate` — libavfilter/af_agate.c.
+ *
+ * A downward (or upward) gate: an envelope follower with separate attack and
+ * release rates tracks the signal's level, and a soft-kneed log-domain gain
+ * curve attenuates it below (or above, in upward mode) the threshold. All
+ * channels are combined into one detection level — by average or by maximum —
+ * so the same gain applies to every channel at a given instant rather than
+ * gating a stereo signal unevenly from side to side.
+ *
+ * There is no sidechain input in this editor, so — as `agate` itself does when
+ * built without one — the signal detects itself: `level_sc` is always
+ * `level_in`, and the two are exposed as one control.
+ */
+export function gate(pcm: Pcm, range: Range, p: EffectValues): Pcm {
+  const { out, start, end } = prepare(pcm, range);
+  const channels = pcm.channels.length;
+  const rms = p.detection >= 0.5;
+  const upward = p.mode >= 0.5;
+  const maxLink = p.link >= 0.5;
+
+  let linThreshold = p.threshold;
+  if (rms) linThreshold *= linThreshold;
+  const linKneeSqrt = Math.sqrt(p.knee);
+  const linKneeStop = linThreshold * linKneeSqrt;
+  const linKneeStart = linThreshold / linKneeSqrt;
+  const thres = Math.log(linThreshold);
+  const kneeStart = Math.log(linKneeStart);
+  const kneeStop = Math.log(linKneeStop);
+
+  // ffmpeg's own formula for turning a millisecond time constant into a
+  // per-sample coefficient for this filter; not derived here, just carried
+  // over so the same attack/release numbers mean the same thing.
+  const attackCoeff = Math.min(1, 1 / ((p.attack * pcm.sampleRate) / 4000));
+  const releaseCoeff = Math.min(1, 1 / ((p.release * pcm.sampleRate) / 4000));
+
+  let linSlope = 0;
+
+  for (let i = start; i < end; i++) {
+    let absSample = Math.abs(pcm.channels[0][i] * p.levelIn);
+    if (maxLink) {
+      for (let c = 1; c < channels; c++) {
+        absSample = Math.max(Math.abs(pcm.channels[c][i] * p.levelIn), absSample);
+      }
+    } else {
+      for (let c = 1; c < channels; c++) absSample += Math.abs(pcm.channels[c][i] * p.levelIn);
+      absSample /= channels;
+    }
+    if (rms) absSample *= absSample;
+
+    linSlope += (absSample - linSlope) * (absSample > linSlope ? attackCoeff : releaseCoeff);
+
+    const detected = upward ? linSlope > linKneeStart : linSlope < linKneeStop;
+    let gainValue = 1;
+    if (linSlope > 0 && detected) {
+      gainValue = gateGain(linSlope, p.ratio, thres, p.knee, kneeStart, kneeStop, p.range, upward);
+    }
+
+    const factor = p.levelIn * gainValue * p.makeup;
+    for (let c = 0; c < channels; c++) out.channels[c][i] = pcm.channels[c][i] * factor;
+  }
+  return out;
+}
+
+/** ffmpeg's `output_gain`: the log-domain ratio curve with a Hermite-smoothed knee. */
+function gateGain(
+  linSlope: number,
+  ratio: number,
+  thres: number,
+  knee: number,
+  kneeStart: number,
+  kneeStop: number,
+  range: number,
+  upward: boolean,
+): number {
+  const slope = Math.log(linSlope);
+  const delta = ratio;
+  let gainValue = (slope - thres) * ratio + thres;
+
+  if (upward) {
+    if (knee > 1 && slope < kneeStop) {
+      gainValue = hermite(slope, kneeStop, kneeStart, (kneeStop - thres) * ratio + thres, kneeStart, delta, 1);
+    }
+  } else if (knee > 1 && slope > kneeStart) {
+    gainValue = hermite(slope, kneeStart, kneeStop, (kneeStart - thres) * ratio + thres, kneeStop, delta, 1);
+  }
+  return Math.max(range, Math.exp(gainValue - slope));
+}
+
+/** libavfilter/hermite.h — a cubic Hermite spline between two points and tangents. */
+function hermite(x: number, x0: number, x1: number, p0: number, p1: number, m0In: number, m1In: number): number {
+  const width = x1 - x0;
+  const t = (x - x0) / width;
+  const m0 = m0In * width;
+  const m1 = m1In * width;
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const c2 = -3 * p0 - 2 * m0 + 3 * p1 - m1;
+  const c3 = 2 * p0 + m0 - 2 * p1 + m1;
+  return c3 * t3 + c2 * t2 + m0 * t + p0;
+}
+
+// ------------------------------------------------------------------ declick
+
+/**
+ * `adeclick` — libavfilter/af_adeclick.c.
+ *
+ * Isolated clicks and pops, not broadband hiss: a short-window autoregressive
+ * model is fitted to the raw signal, run the other way to get a residual, and
+ * whatever spikes far past the residual's own noise floor is treated as a
+ * click. The click samples are then solved for — not just interpolated
+ * linearly — using the AR model itself as the estimator, a technique from
+ * Janssen, Veldhuis and Vaseghi's adaptive AR-based interpolation for
+ * impulsive-noise removal. Windows overlap (75% by default) so no single
+ * click ever falls entirely outside every window's usable interior.
+ *
+ * Every other effect in this file starts cold at the edges of its range, and
+ * says so in the file header. This one does not, and the reason is arithmetic
+ * rather than a preference: ffmpeg's own default reconstruction (`method:
+ * add`, overlap-add) sums contributions from up to `window/hop` overlapping
+ * windows per output sample, and at the true start of a stream there are no
+ * earlier windows to sum — the first stretch fades in from near-silence
+ * before reaching full level, over exactly the width one window minus one hop
+ * spans. Simulating that reconstruction confirms it: with the defaults below,
+ * the very first output sample of an untreated stream comes back at 0.05% of
+ * its true level. Read only within the range, that defect would land inside
+ * whatever the user selected, every time. Reading real audio from outside the
+ * range for context — never writing there — gives the window enough runway to
+ * reach full level before the range starts, so the defect only resurfaces
+ * where it is inherent and correct: at the true start or end of the whole
+ * track, which is exactly where ffmpeg's own stream would show it too.
+ *
+ * `method: save` (overlap-save) has no such ramp — it takes each window's
+ * centre chunk directly, with no cross-window blending — so it needs far less
+ * left context; the little it uses is for the AR fit's benefit, not the
+ * reconstruction's.
+ */
+/**
+ * How far outside its range `declick` reads for context — an upper bound, not
+ * the exact figure: `declick` itself works out how much of that it actually
+ * needs (less, for `method: save`), and unused margin beyond that is simply
+ * never read. Exists so a caller that slices out a smaller clip before
+ * previewing — to avoid cloning a whole multi-minute track for eight seconds
+ * of audition — knows how much real surrounding audio to keep in the slice.
+ */
+export function declickContextSamples(sampleRate: number, p: EffectValues): number {
+  return Math.max(100, Math.trunc((sampleRate * p.window) / 1000));
+}
+
+export function declick(pcm: Pcm, range: Range, p: EffectValues): Pcm {
+  const { out, start, end } = prepare(pcm, range);
+  if (end <= start) return out;
+
+  const sampleRate = pcm.sampleRate;
+  const windowSize = Math.max(100, Math.trunc((sampleRate * p.window) / 1000));
+  const arOrder = Math.max(1, Math.trunc((windowSize * p.arOrder) / 100));
+  const nbBurstSamples = Math.trunc((windowSize * p.burst) / 1000);
+  const hopSize = Math.max(1, Math.trunc(windowSize * (1 - p.overlap / 100)));
+  const method = p.method >= 0.5 ? 1 : 0;
+  const skip = Math.floor((windowSize - hopSize) / 2);
+  const threshold = p.threshold;
+
+  // How many hops of pure left context bring the overlap-add accumulator to
+  // full level before the first kept sample — see the doc comment above.
+  // Verified by direct simulation of the reconstruction, not derived by eye:
+  // it lands exactly on, or one hop past, the point where a constant input
+  // first reconstructs to itself across every overlap percentage in range.
+  //
+  // Clamped at 0, never reaching past the true start of the file into
+  // synthetic zero-padding: a window that straddles real audio and padding is
+  // not one ffmpeg's own reconstruction ever computes — its first window, at
+  // a true stream start, is real data only, nothing before it. Reaching past
+  // 0 for that phantom context fit an AR model to a signal that never existed
+  // and fed the result into the accumulator, which is exactly what the first
+  // version of this port did, and exactly why its whole-track comparison
+  // diverged at 0.42 while the mid-file (real context both sides) comparison
+  // it sits beside was already bit-exact. Falling back to whatever real audio
+  // is actually available — down to none at the true start — reproduces
+  // ffmpeg's own cold-start ramp where that is genuinely all there is to work
+  // with, which is the one place this port does not try to improve on it.
+  const contextHops = method === 0 ? Math.ceil((windowSize - hopSize) / hopSize) : 0;
+  const timelineStart = method === 0 ? Math.max(0, start - contextHops * hopSize) : start - skip;
+
+  const lut = method === 0 ? declickWindowLut(windowSize, hopSize) : null;
+  const total = frameCount(pcm);
+  const read = (channel: Float32Array, i: number): number => (i >= 0 && i < total ? channel[i] : 0);
+
+  const winSrc = new Float64Array(windowSize);
+
+  for (let c = 0; c < pcm.channels.length; c++) {
+    const source = pcm.channels[c];
+    const target = out.channels[c];
+    const accumulator = method === 0 ? new Float64Array(windowSize * 2) : null;
+
+    for (let k = 0; ; k++) {
+      const windowStart = timelineStart + k * hopSize;
+      const emitStart = method === 0 ? windowStart : windowStart + skip;
+      if (emitStart >= end) break;
+
+      for (let j = 0; j < windowSize; j++) winSrc[j] = read(source, windowStart + j);
+      const dst = declickWindow(winSrc, arOrder, threshold, nbBurstSamples);
+
+      let emit: Float64Array;
+      if (method === 0) {
+        const acc = accumulator as Float64Array;
+        for (let j = 0; j < windowSize; j++) acc[j] += dst[j] * (lut as Float64Array)[j];
+        emit = acc.subarray(0, hopSize);
+      } else {
+        emit = dst.subarray(skip, skip + hopSize);
+      }
+
+      for (let m = 0; m < hopSize; m++) {
+        const absolute = emitStart + m;
+        if (absolute >= start && absolute < end) target[absolute] = emit[m];
+      }
+
+      if (method === 0) {
+        const acc = accumulator as Float64Array;
+        acc.copyWithin(0, hopSize);
+        acc.fill(0, acc.length - hopSize);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The window ffmpeg builds by FFT-convolving two rectangular pulses of length
+ * `windowSize-hopSize` and `hopSize` and scaling by `1/(windowSize-hopSize)`.
+ * A box convolved with a box is a closed-form trapezoid, so this is direct
+ * arithmetic rather than the transform ffmpeg uses to reach the same table —
+ * `conv[n] = min(n+1, L0, L1, L0+L1-1-n)` for two boxes of length L0, L1.
+ */
+function declickWindowLut(windowSize: number, hopSize: number): Float64Array {
+  const l0 = windowSize - hopSize;
+  const l1 = hopSize;
+  const lut = new Float64Array(windowSize);
+  const last = l0 + l1 - 2;
+  for (let n = 0; n < windowSize; n++) {
+    lut[n] = n <= last ? Math.min(n + 1, l0, l1, l0 + l1 - 1 - n) / l0 : 0;
+  }
+  return lut;
+}
+
+/** Processes one raw window: fit, detect, interpolate. Returns the window's output. */
+function declickWindow(winSrc: Float64Array, arOrder: number, threshold: number, nbBurstSamples: number): Float64Array {
+  const windowSize = winSrc.length;
+  const dst = Float64Array.from(winSrc);
+
+  const r = autocorrelate(winSrc, arOrder, windowSize, 1 / windowSize);
+  const { coefficients, sigmae } = levinsonDurbin(r, arOrder);
+  if (!Number.isFinite(sigmae) || coefficients.some((v) => !Number.isFinite(v))) {
+    return dst;
+  }
+
+  const detection = new Float64Array(windowSize);
+  for (let i = arOrder; i < windowSize; i++) {
+    let sum = 0;
+    for (let j = 0; j <= arOrder; j++) sum += coefficients[j] * winSrc[i - j];
+    detection[i] = sum;
+  }
+
+  const click = new Uint8Array(windowSize);
+  const level = sigmae * threshold;
+  for (let i = 0; i < windowSize; i++) click[i] = Math.abs(detection[i]) > level ? 1 : 0;
+
+  // Burst fusion: a small gap between two detected clicks is filled in too,
+  // rather than treated as two separate, closely-spaced repairs.
+  let prev = -1;
+  for (let i = 0; i < windowSize; i++) {
+    if (!click[i]) continue;
+    if (prev >= 0 && i > prev + 1 && i <= nbBurstSamples + prev) {
+      for (let j = prev + 1; j < i; j++) click[j] = 1;
+    }
+    prev = i;
+  }
+  // The AR model and the interpolator both need arOrder good samples on
+  // either side, so neither can be trusted this close to the window's edge.
+  click.fill(0, 0, arOrder);
+  click.fill(0, windowSize - arOrder, windowSize);
+
+  const index: number[] = [];
+  for (let i = arOrder; i < windowSize - arOrder; i++) if (click[i]) index.push(i);
+  if (index.length === 0) return dst;
+
+  const interpolated = declickInterpolate(winSrc, arOrder, coefficients, index);
+  if (interpolated) {
+    for (let j = 0; j < index.length; j++) dst[index[j]] = interpolated[j];
+  }
+  return dst;
+}
+
+/**
+ * Solves for the click samples using the AR model's own autocorrelation as
+ * the estimator: build the normal equations from known neighbours within
+ * `arOrder` of each click, then solve via an LDL factorisation. Returns null
+ * on a singular system — pathologically rare, and ffmpeg itself has no
+ * fallback for it either; this one just leaves those samples untouched
+ * instead of failing the whole edit.
+ */
+function declickInterpolate(
+  winSrc: Float64Array,
+  arOrder: number,
+  coefficients: Float64Array,
+  index: number[],
+): Float64Array | null {
+  const auxiliary = autocorrelate(coefficients, arOrder, arOrder + 1, 1);
+  const n = index.length;
+  const matrix = new Float64Array(n * n);
+
+  for (let i = 0; i < n; i++) {
+    for (let j = i; j < n; j++) {
+      const distance = Math.abs(index[j] - index[i]);
+      const value = distance <= arOrder ? auxiliary[distance] : 0;
+      matrix[j * n + i] = value;
+      matrix[i * n + j] = value;
+    }
+  }
+
+  const vector = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let value = 0;
+    for (let j = -arOrder; j <= arOrder; j++) {
+      const pos = index[i] - j;
+      if (!indexContains(index, pos)) value -= winSrc[pos] * auxiliary[Math.abs(j)];
+    }
+    vector[i] = value;
+  }
+
+  return solveLdl(matrix, vector, n);
+}
+
+/** Binary search over the sorted click positions: is `value` itself a click? */
+function indexContains(index: number[], value: number): boolean {
+  if (index.length === 0 || value < index[0] || value > index[index.length - 1]) return false;
+  let start = 0;
+  let end = index.length - 1;
+  while (start <= end) {
+    const i = (end + start) >> 1;
+    if (index[i] === value) return true;
+    if (value < index[i]) end = i - 1;
+    else start = i + 1;
+  }
+  return false;
+}
+
+/**
+ * In-place LDLᵀ factorisation of a symmetric `n×n` matrix (row-major),
+ * without pivoting: the diagonal ends up holding D, the strict lower triangle
+ * holds L. Ported line for line rather than swapped for a pivoted solver,
+ * since the accumulation order is what a bit-exact comparison against ffmpeg
+ * depends on.
+ */
+function factorizeLdl(matrix: Float64Array, n: number): boolean {
+  for (let i = 0; i < n; i++) {
+    const rowI = i * n;
+    let value = matrix[rowI + i];
+    for (let j = 0; j < i; j++) value -= matrix[j * n + j] * matrix[rowI + j] * matrix[rowI + j];
+    if (value === 0) return false;
+    matrix[rowI + i] = value;
+
+    for (let j = i + 1; j < n; j++) {
+      const rowJ = j * n;
+      let x = matrix[rowJ + i];
+      for (let k = 0; k < i; k++) x -= matrix[k * n + k] * matrix[rowI + k] * matrix[rowJ + k];
+      matrix[rowJ + i] = x / matrix[rowI + i];
+    }
+  }
+  return true;
+}
+
+function solveLdl(matrix: Float64Array, vector: Float64Array, n: number): Float64Array | null {
+  if (!factorizeLdl(matrix, n)) return null;
+
+  const y = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const rowI = i * n;
+    let value = vector[i];
+    for (let j = 0; j < i; j++) value -= matrix[rowI + j] * y[j];
+    y[i] = value;
+  }
+
+  const out = new Float64Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    out[i] = y[i] / matrix[i * n + i];
+    for (let j = i + 1; j < n; j++) out[i] -= matrix[j * n + i] * out[j];
+  }
+  return out;
+}
+
+/** `output[i] = scale · Σ input[j]·input[j-i]` for lags `i = 0..order`. */
+function autocorrelate(input: Float64Array, order: number, size: number, scale: number): Float64Array {
+  const output = new Float64Array(order + 1);
+  for (let i = 0; i <= order; i++) {
+    let value = 0;
+    for (let j = i; j < size; j++) value += input[j] * input[j - i];
+    output[i] = value * scale;
+  }
+  return output;
+}
+
+/**
+ * Levinson-Durbin recursion over a window's autocorrelation, producing the
+ * whitening filter `[1, a1, …, a_order]` and its residual's standard
+ * deviation. `r` must have `order+1` entries.
+ */
+function levinsonDurbin(r: Float64Array, order: number): { coefficients: Float64Array; sigmae: number } {
+  const coefficients = new Float64Array(order + 1);
+  if (order === 0) return { coefficients: Float64Array.of(1), sigmae: Math.sqrt(r[0]) };
+
+  const k = new Float64Array(order + 1);
+  const a = new Float64Array(order);
+
+  k[0] = a[0] = -r[1] / r[0];
+  let alpha = r[0] * (1 - k[0] * k[0]);
+
+  for (let i = 1; i < order; i++) {
+    let epsilon = 0;
+    for (let j = 0; j < i; j++) epsilon += a[j] * r[i - j];
+    epsilon += r[i + 1];
+
+    k[i] = -epsilon / alpha;
+    alpha *= 1 - k[i] * k[i];
+    for (let j = i - 1; j >= 0; j--) k[j] = a[j] + k[i] * a[i - j - 1];
+    for (let j = 0; j <= i; j++) a[j] = k[j];
+  }
+
+  coefficients[0] = 1;
+  for (let i = 1; i <= order; i++) coefficients[i] = a[i - 1];
+  return { coefficients, sigmae: Math.sqrt(alpha) };
+}
+
+// ---------------------------------------------------------------- cleanStem
+
+/**
+ * Not an ffmpeg filter — a one-tap chain of `declick` then `gate`, each at its
+ * own registry defaults, applied as a single edit. For a stem with scattered
+ * clicks and a noisy floor between phrases, this is the two things worth
+ * trying before reaching for either effect's own controls.
+ */
+export function cleanStem(pcm: Pcm, range: Range, declickDefaults: EffectValues, gateDefaults: EffectValues): Pcm {
+  return gate(declick(pcm, range, declickDefaults), range, gateDefaults);
 }

@@ -51,6 +51,14 @@ export interface EffectSpec {
   params: ParamSpec[];
   defaults: EffectValues;
   apply(pcm: Pcm, range: Range, values: EffectValues): Pcm;
+  /**
+   * How many samples outside its range this effect reads (never writes) for
+   * context — currently only `declick`, which needs real audio around a
+   * selection to avoid the fade its own reconstruction has at a true cold
+   * start. Absent for every effect that only ever looks inside its range.
+   * Preview uses this to keep enough real margin in the clip it slices out.
+   */
+  contextSamples?(sampleRate: number, values: EffectValues): number;
 }
 
 const slider = (
@@ -407,6 +415,74 @@ export const EFFECTS: readonly EffectSpec[] = [
     ],
     defaults: { strength: 0.2, range: 0.5, slope: 0.5, levelIn: 0.9, levelOut: 1 },
     apply: fx.crossfeed,
+  },
+
+  // ----------------------------------------------------------------- repair
+  {
+    id: 'declick',
+    label: 'Declick',
+    hint: 'Finds isolated clicks and pops and fills them in from the model around them.',
+    params: [
+      slider('window', 'Window', 10, 100, 1, 'ms', 0),
+      slider('overlap', 'Overlap', 50, 95, 1, '%', 0),
+      slider('arOrder', 'Model order', 0, 25, 1, '%', 0),
+      slider('threshold', 'Threshold', 1, 100, 0.5, '', 1),
+      slider('burst', 'Burst fusion', 0, 10, 0.1, 'ms', 1),
+      choice('method', 'Reconstruction', ['Cross-fade', 'Direct']),
+    ],
+    defaults: { window: 55, overlap: 75, arOrder: 2, threshold: 2, burst: 2, method: 0 },
+    apply: fx.declick,
+    contextSamples: fx.declickContextSamples,
+  },
+  {
+    id: 'agate',
+    label: 'Noise gate',
+    hint: 'Quiets the signal below a threshold — good for hiss or bleed between phrases.',
+    // ratio, attack and release are all narrower here than ffmpeg's own
+    // 1–9000 / 0.01–9000 ms ranges: past about 30:1 a gate is indistinguishable
+    // from fully closed, and a multi-second attack or release has no practical
+    // use gating phrases in a stem — both ends are ffmpeg's, tuned for uses
+    // this editor does not have.
+    params: [
+      slider('levelIn', 'Input', 0.0625, 4, 0.05, '×', 2),
+      choice('mode', 'Mode', ['Downward', 'Upward']),
+      slider('threshold', 'Threshold', 0, 1, 0.005, '', 3),
+      slider('range', 'Max reduction', 0, 1, 0.01, '', 2),
+      slider('ratio', 'Ratio', 1, 30, 0.5, ':1', 1),
+      slider('attack', 'Attack', 0.01, 200, 0.5, 'ms', 2),
+      slider('release', 'Release', 1, 2000, 1, 'ms', 0),
+      slider('makeup', 'Makeup', 1, 16, 0.1, '×', 1),
+      slider('knee', 'Knee', 1, 8, 0.1, '', 1),
+      choice('detection', 'Detection', ['Peak', 'RMS']),
+      choice('link', 'Channels', ['Average', 'Maximum']),
+    ],
+    defaults: {
+      levelIn: 1,
+      mode: 0,
+      threshold: 0.125,
+      range: 0.06125,
+      ratio: 2,
+      attack: 20,
+      release: 250,
+      makeup: 1,
+      knee: 2.828427125,
+      detection: 1,
+      link: 0,
+    },
+    apply: fx.gate,
+  },
+  {
+    id: 'equalizer',
+    label: 'Parametric EQ',
+    hint: 'Boosts or cuts a narrow band. Dial out a ringing resonance by ear.',
+    params: [
+      slider('frequency', 'Frequency', 20, 20000, 10, 'Hz', 0),
+      slider('width', 'Q', 0.1, 10, 0.05, '', 2),
+      slider('gain', 'Gain', -24, 24, 0.5, 'dB', 1),
+    ],
+    // ffmpeg's own default is 0 Hz / 0 dB, a true no-op; see effects.ts.
+    defaults: { frequency: 1000, width: 1, gain: 0 },
+    apply: fx.equalizer,
   },
 ];
 

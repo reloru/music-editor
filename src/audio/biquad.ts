@@ -159,6 +159,26 @@ export function lowShelf(
   );
 }
 
+/**
+ * Peaking EQ — ffmpeg's `equalizer` filter: boost or cut a band centred on
+ * `frequency`, leaving the rest of the spectrum alone. Used here to let a
+ * ringing resonance be dialled out by ear, since there is no automatic way to
+ * find one.
+ */
+export function peakingEq(
+  sampleRate: number,
+  frequency: number,
+  gainDb: number,
+  width: number,
+  widthType: WidthType = 'q',
+): Biquad {
+  const a = Math.pow(10, gainDb / 40);
+  const w0 = omega(sampleRate, frequency);
+  const alpha = alphaFor(w0, width, widthType, a);
+  const cos = Math.cos(w0);
+  return normalise(1 + alpha * a, -2 * cos, 1 - alpha * a, 1 + alpha / a, -2 * cos, 1 - alpha / a);
+}
+
 export function highShelf(
   sampleRate: number,
   frequency: number,

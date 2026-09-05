@@ -153,6 +153,9 @@ export class App {
       case 'dc-offset':
         void editor.removeDcOffset();
         break;
+      case 'clean-stem':
+        void editor.cleanStem();
+        break;
       case 'gain':
         this.openGainSheet();
         break;
