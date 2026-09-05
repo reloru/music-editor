@@ -67,10 +67,23 @@ export class AudioEngine {
    * is the backstop for the paths that reach here indirectly — a `seek()`
    * during playback, say — so the worst case is audio that stays silent until
    * the next tap rather than a caller that never returns.
+   *
+   * The check is `!== 'running'`, not `=== 'suspended'`. Safari has a third,
+   * non-standard state — `interrupted` — that it moves a context into after a
+   * phone call, a system dialog, or (per WebKit bug 263627 and multiple open
+   * issues against the Web Audio spec and Tone.js) coming back from the
+   * background; `resume()` on an interrupted context has been reported to
+   * work once actually called. Gating on `=== 'suspended'` alone, as this did,
+   * means `interrupted` never reaches `resume()` at all — the exact bug
+   * reported against Tone.js's own context wrapper, and, on this project, the
+   * likely reason playback stopped producing sound or advancing the clock
+   * after the editor sat unresponsive for several minutes running Declick on
+   * a long track: an interruption during that stretch is far more likely than
+   * during any of this app's other, near-instant operations.
    */
   async ensureContext(): Promise<AudioContext> {
     const ctx = this.createContextIfNeeded();
-    if (ctx.state === 'suspended') {
+    if (ctx.state !== 'running') {
       await Promise.race([
         ctx.resume().catch(() => undefined),
         new Promise<void>((resolve) => setTimeout(resolve, RESUME_TIMEOUT_MS)),
@@ -263,9 +276,16 @@ export class AudioEngine {
     }
   }
 
-  /** Re-arms audio after an interruption (a call, or the tab going background). */
+  /**
+   * Re-arms audio after an interruption (a call, or the tab going background).
+   *
+   * `!== 'running'`, not `=== 'suspended'`: see `ensureContext` for why —
+   * this is the path meant to catch exactly the interruption that puts Safari
+   * into its own `interrupted` state, so gating on the standard state name
+   * alone made it a no-op for the one case it exists for.
+   */
   async resumeAfterInterruption(): Promise<void> {
-    if (this.ctx && this.ctx.state === 'suspended' && this.state === 'playing') {
+    if (this.ctx && this.ctx.state !== 'running' && this.state === 'playing') {
       await this.ctx.resume();
     }
   }

@@ -1286,7 +1286,31 @@ export function declickContextSamples(sampleRate: number, p: EffectValues): numb
   return Math.max(100, Math.trunc((sampleRate * p.window) / 1000));
 }
 
-export function declick(pcm: Pcm, range: Range, p: EffectValues): Pcm {
+/**
+ * How often `declick` yields to the event loop while it runs, in milliseconds
+ * of wall-clock time between yields. `declick`'s AR fit and LDL solve are
+ * expensive enough per window that a long selection can hold the main thread
+ * for minutes; that block is what plausibly drove the browser (or, on iOS
+ * Safari specifically, the audio session) to treat the tab as unresponsive
+ * mid-run, which is the same mechanism that puts an `AudioContext` into
+ * Safari's `interrupted` state (see `engine.ts`). Yielding this often keeps
+ * every individual gap short enough that no such intervention triggers,
+ * without adding enough `setTimeout` overhead to meaningfully lengthen a
+ * short run.
+ */
+const DECLICK_YIELD_INTERVAL_MS = 16;
+
+function cooperativeYielder(): () => Promise<void> {
+  let last = performance.now();
+  return async () => {
+    const now = performance.now();
+    if (now - last < DECLICK_YIELD_INTERVAL_MS) return;
+    last = now;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  };
+}
+
+export async function declick(pcm: Pcm, range: Range, p: EffectValues): Promise<Pcm> {
   const { out, start, end } = prepare(pcm, range);
   if (end <= start) return out;
 
@@ -1325,6 +1349,7 @@ export function declick(pcm: Pcm, range: Range, p: EffectValues): Pcm {
   const read = (channel: Float32Array, i: number): number => (i >= 0 && i < total ? channel[i] : 0);
 
   const winSrc = new Float64Array(windowSize);
+  const yieldPeriodically = cooperativeYielder();
 
   for (let c = 0; c < pcm.channels.length; c++) {
     const source = pcm.channels[c];
@@ -1335,6 +1360,8 @@ export function declick(pcm: Pcm, range: Range, p: EffectValues): Pcm {
       const windowStart = timelineStart + k * hopSize;
       const emitStart = method === 0 ? windowStart : windowStart + skip;
       if (emitStart >= end) break;
+
+      await yieldPeriodically();
 
       for (let j = 0; j < windowSize; j++) winSrc[j] = read(source, windowStart + j);
       const dst = declickWindow(winSrc, arOrder, threshold, nbBurstSamples);
@@ -1577,6 +1604,11 @@ function levinsonDurbin(r: Float64Array, order: number): { coefficients: Float64
  * clicks and a noisy floor between phrases, this is the two things worth
  * trying before reaching for either effect's own controls.
  */
-export function cleanStem(pcm: Pcm, range: Range, declickDefaults: EffectValues, gateDefaults: EffectValues): Pcm {
-  return gate(declick(pcm, range, declickDefaults), range, gateDefaults);
+export async function cleanStem(
+  pcm: Pcm,
+  range: Range,
+  declickDefaults: EffectValues,
+  gateDefaults: EffectValues,
+): Promise<Pcm> {
+  return gate(await declick(pcm, range, declickDefaults), range, gateDefaults);
 }

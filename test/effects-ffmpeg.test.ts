@@ -411,21 +411,19 @@ describe.skipIf(!hasFfmpeg())('effects against ffmpeg', () => {
   });
 
   for (const effect of EFFECTS satisfies readonly EffectSpec[]) {
-    it(`matches ffmpeg for ${effect.id}`, () => {
-      check(effect.id, effect.apply(source, range, effect.defaults).channels, runFfmpeg(input, CHAINS[effect.id]));
+    it(`matches ffmpeg for ${effect.id}`, async () => {
+      const mine = await effect.apply(source, range, effect.defaults);
+      check(effect.id, mine.channels, runFfmpeg(input, CHAINS[effect.id]));
     });
   }
 
   for (const variant of VARIANTS) {
-    it(`matches ffmpeg for ${variant.id}: ${variant.label}`, () => {
+    it(`matches ffmpeg for ${variant.id}: ${variant.label}`, async () => {
       const effect = EFFECTS.find((entry) => entry.id === variant.id);
       expect(effect, `no effect registered as ${variant.id}`).toBeDefined();
       const values = { ...effect!.defaults, ...variant.values };
-      check(
-        `${variant.id} (${variant.label})`,
-        effect!.apply(source, range, values).channels,
-        runFfmpeg(input, variant.chain),
-      );
+      const mine = await effect!.apply(source, range, values);
+      check(`${variant.id} (${variant.label})`, mine.channels, runFfmpeg(input, variant.chain));
     });
   }
 
@@ -437,7 +435,7 @@ describe.skipIf(!hasFfmpeg())('effects against ffmpeg', () => {
    * bridging, so this builds a fixture that does: two opposite-polarity
    * spikes 5 samples apart in channel 0, a clean control tone in channel 1.
    */
-  it('matches ffmpeg when burst fusion bridges two close clicks', () => {
+  it('matches ffmpeg when burst fusion bridges two close clicks', async () => {
     const frames = 6000;
     const burstFixture = createPcm(2, frames, RATE);
     for (let i = 0; i < frames; i++) {
@@ -450,7 +448,7 @@ describe.skipIf(!hasFfmpeg())('effects against ffmpeg', () => {
 
     const declickSpec = EFFECTS.find((entry) => entry.id === 'declick')!;
     const values = { ...declickSpec.defaults, burst: 5 };
-    const mine = declickSpec.apply(burstFixture, { start: 0, end: frames }, values).channels;
+    const mine = (await declickSpec.apply(burstFixture, { start: 0, end: frames }, values)).channels;
     const theirs = runFfmpeg(toInterleaved(burstFixture), 'adeclick=w=55:o=75:a=2:t=2:b=5:m=add');
     check('declick (burst fusion across two close clicks)', mine, theirs, frames / 2);
   });
@@ -468,7 +466,7 @@ describe.skipIf(!hasFfmpeg())('effects against ffmpeg', () => {
    * treating it as a slice of the full one must agree, because both are the
    * same computation.
    */
-  it('matches ffmpeg on a mid-file selection using real surrounding context', () => {
+  it('matches ffmpeg on a mid-file selection using real surrounding context', async () => {
     const declickSpec = EFFECTS.find((entry) => entry.id === 'declick')!;
     const values = declickSpec.defaults;
     const windowSize = Math.max(100, Math.trunc((RATE * values.window) / 1000));
@@ -485,7 +483,7 @@ describe.skipIf(!hasFfmpeg())('effects against ffmpeg', () => {
     };
     const excerptRange = { start: selection.start - excerptStart, end: selection.end - excerptStart };
 
-    const mine = declickSpec.apply(excerpt, excerptRange, values).channels.map((c) =>
+    const mine = (await declickSpec.apply(excerpt, excerptRange, values)).channels.map((c) =>
       c.subarray(excerptRange.start, excerptRange.end),
     );
     const theirsFull = runFfmpeg(toInterleaved(excerpt), CHAINS.declick);
