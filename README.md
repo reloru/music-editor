@@ -27,12 +27,29 @@ other at the nearest end of the track.
 clipping markers, and a peak pyramid behind it so a five-minute track redraws at
 60 fps instead of rescanning 26 million samples per frame.
 
-**Effects** — sixteen of them, each ported from the ffmpeg filter it is named
+**Effects** — nineteen of them, each ported from the ffmpeg filter it is named
 after and each with its own controls: bass shelf, crystalizer, exciter, sub
 boost and a telephone band; bit crusher and soft clip; echo, phaser, chorus,
-flanger, tremolo and pulsator; Haas, stereo widen and crossfeed. Preview renders
-the first eight seconds of the selection and plays it, through the same code
-Apply writes with, so what you hear is what you get.
+flanger, tremolo and pulsator; Haas, stereo widen and crossfeed; declick, a
+noise gate and a parametric EQ for cleaning up a stem. Preview renders the
+first eight seconds of the selection and plays it, through the same code Apply
+writes with, so what you hear is what you get.
+
+**Clean stem** — one tap: declick then the noise gate, each at its own
+defaults, as a single edit. The two things worth trying first on a stem with
+scattered clicks or a noisy floor between phrases, before reaching for either
+effect's own controls.
+
+Declick is the one effect that reads real audio from outside the selection —
+never writing there — because its reconstruction needs a run-up of real signal
+to reach full level before the selection starts; without it, the first
+stretch of *any* declicked audio fades in from near-silence, which is provably
+true of ffmpeg's own filter and not just this port (see the comment on
+`declick` in `effects.ts`). A "hollow pipe" or metallic ring, the other
+common stem artefact, is comb filtering from phase cancellation during
+separation — there is no reliable automatic fix for an unknown delay and
+phase, so the parametric EQ exists to let that resonance be found and pulled
+down by ear instead.
 
 **Export** — MP3 at 128/192/256/320 kbps (encoded in a Web Worker so the UI stays
 live) or WAV at 16-bit, 24-bit or 32-bit float. Export the whole track or just
@@ -175,8 +192,8 @@ full scale, and clamping happens once, at export.
 ## Testing
 
 ```bash
-npm test          # 253 unit tests
-npm run test:e2e  # 24 end-to-end tests in a real browser
+npm test          # 279 unit tests
+npm run test:e2e  # 26 end-to-end tests in a real browser
 ```
 
 The end-to-end suite drives the built app in Chromium at 430 × 932 with touch
@@ -196,8 +213,10 @@ E2E_BASE_URL=http://127.0.0.1:8787 npm run test:e2e
 Reading a filter's source and rewriting it is not proof that the rewrite is the
 same filter, so `test/effects-ffmpeg.test.ts` runs the real one. It pipes the
 same samples through `ffmpeg -af <filter>` with the same options and compares
-the output sample for sample, across every effect's defaults and 32 further
-settings covering the modes, curves and branches the defaults never reach.
+the output sample for sample, across every effect's defaults and dozens of
+further settings covering the modes, curves and branches the defaults never
+reach — including a mid-file selection compared against ffmpeg run on the
+same excerpt, which is what validates `declick`'s context-reading design.
 
 Install ffmpeg and it runs; without it on `PATH` the suite skips itself, so CI
 stays green and `test/effects.test.ts` carries the rest. `EFFECT_DIFF=1` prints
@@ -208,11 +227,17 @@ EFFECT_DIFF=1 npx vitest run test/effects-ffmpeg.test.ts
 ```
 
 Most come back bit-identical; the worst case is 1.1 × 10⁻⁶, which is float32
-rounding on both sides. It has already earned its keep — it caught a table
-sized with `Math.round` where ffmpeg uses `lrint` (a sample of drift per cycle
-in tremolo), and a missing branch for negative crystalizer intensities, where
-ffmpeg dispatches on the sign to an inverse recursion that feeds its own output
-back rather than the input. Neither was visible in a reading of the source.
+rounding on both sides. It has already earned its keep three times over: a
+table sized with `Math.round` where ffmpeg uses `lrint` (a sample of drift per
+cycle in tremolo); a missing branch for negative crystalizer intensities,
+where ffmpeg dispatches on the sign to an inverse recursion that feeds its own
+output back rather than the input; and, in `declick`, phantom left-context
+windows that mixed real audio with synthetic zero-padding at a true file
+boundary — a window ffmpeg's own reconstruction never computes, since it has
+no window before its first one, caught at 0.42 absolute divergence on a
+whole-track comparison and fixed by clamping the context to whatever real
+audio actually exists. None of the three were visible in a reading of the
+source.
 
 Where a chain in that file names `precision=f64`, it is because ffmpeg's biquads
 pick their working precision from the input format; matching it makes the

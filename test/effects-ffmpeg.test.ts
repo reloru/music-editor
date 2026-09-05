@@ -159,6 +159,12 @@ const CHAINS: Record<string, string> = {
     'haas=level_in=1:level_out=1:side_gain=1:middle_source=mid:middle_phase=0:left_delay=2.05:left_balance=-1:left_gain=1:left_phase=0:right_delay=2.12:right_balance=1:right_gain=1:right_phase=1',
   stereowiden: 'stereowiden=delay=20:feedback=0.3:crossfeed=0.3:drymix=0.8',
   crossfeed: 'crossfeed=strength=0.2:range=0.5:slope=0.5:level_in=0.9:level_out=1:block_size=0',
+  declick: 'adeclick=w=55:o=75:a=2:t=2:b=2:m=add',
+  agate:
+    'agate=level_in=1:mode=downward:threshold=0.125:range=0.06125:ratio=2:attack=20:release=250:makeup=1:knee=2.828427125:detection=rms:link=average',
+  // Defaults are 0 dB — a true no-op both sides, so this only proves the two
+  // sides agree on doing nothing; the meaningful check is in VARIANTS below.
+  equalizer: 'equalizer=f=1000:width_type=q:w=1:g=0',
 };
 
 /**
@@ -331,6 +337,42 @@ const VARIANTS: { id: string; label: string; values: Record<string, number>; cha
     values: { highpass: 500, lowpass: 2400, volume: 2 },
     chain: 'highpass=f=500:precision=f64,lowpass=f=2400:precision=f64,volume=2',
   },
+  {
+    id: 'declick',
+    label: 'overlap-save reconstruction',
+    values: { method: 1 },
+    chain: 'adeclick=w=55:o=75:a=2:t=2:b=2:m=save',
+  },
+  {
+    id: 'declick',
+    label: 'shorter window, higher order, more sensitive',
+    values: { window: 30, overlap: 60, arOrder: 8, threshold: 1.2, burst: 1 },
+    chain: 'adeclick=w=30:o=60:a=8:t=1.2:b=1:m=add',
+  },
+  {
+    id: 'agate',
+    label: 'upward, peak detection, maximum link',
+    values: { mode: 1, detection: 0, link: 1, threshold: 0.3, ratio: 4, attack: 5, release: 80 },
+    chain: 'agate=level_in=1:mode=upward:threshold=0.3:range=0.06125:ratio=4:attack=5:release=80:makeup=1:knee=2.828427125:detection=peak:link=maximum',
+  },
+  {
+    id: 'agate',
+    label: 'no knee, fast release, makeup gain',
+    values: { knee: 1, release: 20, makeup: 2, threshold: 0.2 },
+    chain: 'agate=level_in=1:mode=downward:threshold=0.2:range=0.06125:ratio=2:attack=20:release=20:makeup=2:knee=1:detection=rms:link=average',
+  },
+  {
+    id: 'equalizer',
+    label: 'boost a low band with a wide Q',
+    values: { frequency: 200, width: 2, gain: 9 },
+    chain: 'equalizer=f=200:width_type=q:w=2:g=9:precision=f64',
+  },
+  {
+    id: 'equalizer',
+    label: 'narrow cut in the high end',
+    values: { frequency: 6000, width: 0.3, gain: -12 },
+    chain: 'equalizer=f=6000:width_type=q:w=0.3:g=-12:precision=f64',
+  },
 ];
 
 describe.skipIf(!hasFfmpeg())('effects against ffmpeg', () => {
@@ -352,9 +394,9 @@ describe.skipIf(!hasFfmpeg())('effects against ffmpeg', () => {
    * their working precision from the input format and would otherwise run in
    * float32; matched precisions make those comparisons bit-exact.
    */
-  const check = (name: string, mine: Float32Array[], theirs: Float32Array[]): void => {
+  const check = (name: string, mine: Float32Array[], theirs: Float32Array[], minFrames = FRAMES / 2): void => {
     const divergence = compare(mine, theirs);
-    expect(divergence.frames, `${name}: too little overlap to compare`).toBeGreaterThan(FRAMES / 2);
+    expect(divergence.frames, `${name}: too little overlap to compare`).toBeGreaterThan(minFrames);
     expect(divergence.maxAbsolute, `max |Δ| for ${name}`).toBeLessThan(1e-5);
     expect(divergence.relativeRms, `relative RMS error for ${name}`).toBeLessThan(1e-5);
     if (process.env.EFFECT_DIFF) {
@@ -386,4 +428,74 @@ describe.skipIf(!hasFfmpeg())('effects against ffmpeg', () => {
       );
     });
   }
+
+  /**
+   * Burst fusion bridges a small gap between two nearby detections rather
+   * than repairing them as two separate clicks. Neither VARIANTS nor the
+   * shared fixture's own two clicks (one per channel, 200 samples apart) puts
+   * two detections close enough together in one channel to exercise that
+   * bridging, so this builds a fixture that does: two opposite-polarity
+   * spikes 5 samples apart in channel 0, a clean control tone in channel 1.
+   */
+  it('matches ffmpeg when burst fusion bridges two close clicks', () => {
+    const frames = 6000;
+    const burstFixture = createPcm(2, frames, RATE);
+    for (let i = 0; i < frames; i++) {
+      const t = i / RATE;
+      burstFixture.channels[0][i] = 0.3 * Math.sin(2 * Math.PI * 250 * t);
+      burstFixture.channels[1][i] = 0.3 * Math.sin(2 * Math.PI * 410 * t);
+    }
+    burstFixture.channels[0][2000] = 0.9;
+    burstFixture.channels[0][2005] = -0.9;
+
+    const declickSpec = EFFECTS.find((entry) => entry.id === 'declick')!;
+    const values = { ...declickSpec.defaults, burst: 5 };
+    const mine = declickSpec.apply(burstFixture, { start: 0, end: frames }, values).channels;
+    const theirs = runFfmpeg(toInterleaved(burstFixture), 'adeclick=w=55:o=75:a=2:t=2:b=5:m=add');
+    check('declick (burst fusion across two close clicks)', mine, theirs, frames / 2);
+  });
+
+  /**
+   * `declick` reads real audio outside its range for context (see its own doc
+   * comment), which the whole-track comparisons above cannot exercise — there,
+   * the range already covers the entire buffer, so the "outside" is only ever
+   * the true, silent edge of the file. This proves the context-reading design
+   * itself: extract a window/context/window-sized excerpt of the shared
+   * fixture around a mid-file selection, run ffmpeg over that excerpt exactly
+   * as `declick` runs over the equivalent slice of the full buffer, and
+   * compare only the selection's own output. If the design is right, treating
+   * "selection plus real neighbouring audio" as its own small file and
+   * treating it as a slice of the full one must agree, because both are the
+   * same computation.
+   */
+  it('matches ffmpeg on a mid-file selection using real surrounding context', () => {
+    const declickSpec = EFFECTS.find((entry) => entry.id === 'declick')!;
+    const values = declickSpec.defaults;
+    const windowSize = Math.max(100, Math.trunc((RATE * values.window) / 1000));
+
+    const selection = { start: 5000, end: 15000 };
+    const excerptStart = selection.start - windowSize;
+    const excerptEnd = selection.end + windowSize;
+    expect(excerptStart).toBeGreaterThanOrEqual(0);
+    expect(excerptEnd).toBeLessThanOrEqual(FRAMES);
+
+    const excerpt: Pcm = {
+      sampleRate: source.sampleRate,
+      channels: source.channels.map((channel) => channel.slice(excerptStart, excerptEnd)),
+    };
+    const excerptRange = { start: selection.start - excerptStart, end: selection.end - excerptStart };
+
+    const mine = declickSpec.apply(excerpt, excerptRange, values).channels.map((c) =>
+      c.subarray(excerptRange.start, excerptRange.end),
+    );
+    const theirsFull = runFfmpeg(toInterleaved(excerpt), CHAINS.declick);
+    const theirs = theirsFull.map((c) => c.subarray(excerptRange.start, excerptRange.end));
+
+    check(
+      'declick (mid-file selection, real context)',
+      mine,
+      theirs,
+      (excerptRange.end - excerptRange.start) / 2,
+    );
+  });
 });

@@ -9,8 +9,8 @@
 import { AudioEngine } from './audio/engine';
 import { decodeAudioFile } from './audio/decode';
 import * as dsp from './audio/dsp';
-import type { EffectSpec } from './audio/effect-registry';
-import type { EffectValues } from './audio/effects';
+import { findEffect, type EffectSpec } from './audio/effect-registry';
+import { cleanStem as cleanStemEffect, type EffectValues } from './audio/effects';
 import { changeSpeed } from './audio/offline';
 import { buildPeaks, type PeakPyramid } from './audio/peaks';
 import {
@@ -478,10 +478,17 @@ export class Editor {
    * it, without touching the document.
    *
    * The window is sliced out first and the effect run over the whole slice,
-   * rather than run over a sub-range of the full buffer. The two are sample-
-   * identical here — every effect starts its filter state cold at the beginning
-   * of the range either way — and slicing first is what keeps a preview on a
-   * five-minute track from allocating a copy of the whole thing.
+   * rather than run over a sub-range of the full buffer, which is what keeps a
+   * preview on a five-minute track from allocating a copy of the whole thing.
+   * For almost every effect that is sample-identical to applying it in place,
+   * since filter state starts cold at the beginning of the range either way.
+   *
+   * `declick` is the exception: it reads real audio outside its range for
+   * context (see `EffectSpec.contextSamples`), and a slice trimmed exactly to
+   * the preview window would hand it none, showing the preview the same
+   * cold-start fade `applyEffect` never would. The slice keeps that much extra
+   * margin on each side, and it comes back off after processing — the effect
+   * sees genuine context either way, so what plays back is what Apply writes.
    */
   async previewEffect(spec: EffectSpec, values: EffectValues, seconds = 8): Promise<void> {
     if (!this.pcm) return;
@@ -490,15 +497,34 @@ export class Editor {
       return;
     }
     const range = this.effectiveRange;
-    const window = {
-      start: range.start,
-      end: Math.min(range.end, range.start + Math.round(seconds * this.sampleRate)),
-    };
-    if (window.end <= window.start) return;
+    const previewEnd = Math.min(range.end, range.start + Math.round(seconds * this.sampleRate));
+    if (previewEnd <= range.start) return;
 
-    const clip = dsp.slice(this.pcm, window);
-    const rendered = spec.apply(clip, { start: 0, end: frameCount(clip) }, values);
-    await this.engine.playPreview(rendered);
+    const context = spec.contextSamples?.(this.sampleRate, values) ?? 0;
+    const sliceStart = Math.max(0, range.start - context);
+    const sliceEnd = Math.min(this.totalSamples, previewEnd + context);
+    const clip = dsp.slice(this.pcm, { start: sliceStart, end: sliceEnd });
+
+    const effectRange = { start: range.start - sliceStart, end: previewEnd - sliceStart };
+    const rendered = spec.apply(clip, effectRange, values);
+    const trimmed = context > 0 ? dsp.slice(rendered, effectRange) : rendered;
+    await this.engine.playPreview(trimmed);
+  }
+
+  /**
+   * One tap: Declick then Noise gate, each at its own registry defaults, as a
+   * single edit. The two things worth trying on a stem with scattered clicks
+   * and a noisy floor between phrases before reaching for either effect's own
+   * controls.
+   */
+  async cleanStem(): Promise<void> {
+    const declickSpec = findEffect('declick');
+    const gateSpec = findEffect('agate');
+    if (!declickSpec || !gateSpec) return;
+    const range = this.effectiveRange;
+    await this.applyEdit('Clean stem', (pcm) =>
+      cleanStemEffect(pcm, range, declickSpec.defaults, gateSpec.defaults),
+    );
   }
 
   stopPreview(): void {

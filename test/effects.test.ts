@@ -127,7 +127,12 @@ describe('every effect', () => {
   it('changes something inside the range', () => {
     // A no-op at its defaults would pass every check above, so assert the
     // opposite too: each effect audibly does something out of the box.
-    for (const effect of EFFECTS) {
+    //
+    // `equalizer` is the one deliberate exception: it is a dial-in tool with
+    // no automatic target, so 0 dB of gain — a genuine no-op, not a rounding
+    // artefact — is the only honest default, the same way the Gain sheet
+    // defaults to 0 dB. Every other effect is expected to do something.
+    for (const effect of EFFECTS.filter((entry) => entry.id !== 'equalizer')) {
       const out = effect.apply(stereo, whole, effect.defaults);
       let changed = false;
       for (let c = 0; c < out.channels.length && !changed; c++) {
@@ -279,5 +284,123 @@ describe('behaviours pinned against a single ffmpeg version', () => {
     // 8821 apart must land on the neighbouring entry instead, which is what
     // rules out the off-by-one: the two assertions swap if the size is wrong.
     expect(Math.abs(out.channels[0][probe] - out.channels[0][probe + 8821])).toBeGreaterThan(1e-5);
+  });
+});
+
+describe('declick, gate and equalizer', () => {
+  /**
+   * A sine with one sample driven far outside its own range — the AR model
+   * fitted to the surrounding, highly predictable signal should flag it and
+   * fill it in from that model, landing close to where the untouched sine
+   * would have been.
+   */
+  it('removes an injected click from an otherwise smooth tone', () => {
+    const frames = 8000;
+    const pcm = createPcm(1, frames, RATE);
+    for (let i = 0; i < frames; i++) pcm.channels[0][i] = 0.4 * Math.sin((2 * Math.PI * 300 * i) / RATE);
+    const trueValue = pcm.channels[0][4000];
+    pcm.channels[0][4000] = 0.95;
+
+    const declickSpec = findEffect('declick')!;
+    const out = declickSpec.apply(pcm, { start: 0, end: frames }, declickSpec.defaults);
+
+    const rawError = Math.abs(0.95 - trueValue);
+    const repairedError = Math.abs(out.channels[0][4000] - trueValue);
+    expect(repairedError, 'repaired sample should land near the true curve').toBeLessThan(rawError * 0.1);
+  });
+
+  /**
+   * Away from the true edges of the buffer — where `declick`'s own
+   * reconstruction is inherently a ramp, by design, see `effects.ts` — a
+   * click-free tone should come back close to what went in.
+   */
+  it('leaves a click-free tone close to unchanged, away from the true edges', () => {
+    const frames = 20000;
+    const pcm = createPcm(1, frames, RATE);
+    for (let i = 0; i < frames; i++) pcm.channels[0][i] = 0.3 * Math.sin((2 * Math.PI * 440 * i) / RATE);
+
+    const declickSpec = findEffect('declick')!;
+    const out = declickSpec.apply(pcm, { start: 0, end: frames }, declickSpec.defaults);
+
+    let worst = 0;
+    for (let i = 5000; i < 15000; i++) worst = Math.max(worst, Math.abs(out.channels[0][i] - pcm.channels[0][i]));
+    expect(worst).toBeLessThan(1e-6);
+  });
+
+  /**
+   * Regression pin for a real bug: the first version of this port reached for
+   * left context past the true start of the buffer regardless of whether any
+   * real audio existed there, fitting an AR model to a window that mixed real
+   * signal with synthetic zero-padding — a window ffmpeg's own reconstruction
+   * never computes for `method: add` (cross-fade), since it has no window
+   * before its first one. Caught by `effects-ffmpeg.test.ts` at 0.42 absolute
+   * divergence on a whole-track comparison.
+   *
+   * `method: save` (Direct) is what pins it here without ffmpeg present, and
+   * on purpose: cross-fade's own reconstruction blends contributions from
+   * multiple overlapping windows, weighted by a window function that is
+   * still ramping up this close to a true stream start — a few tenths of
+   * amplitude of repair error at sample 50 is that ramp, present in ffmpeg's
+   * own output too, not a bug, and measuring it precisely here would pin an
+   * artefact of the reconstruction rather than the click detector. Direct
+   * mode has no such blend — each window's own centre chunk is taken
+   * verbatim — so a click near the edge repairs exactly there, and does
+   * before and after the fix in this file; only cross-fade's true-edge
+   * behaviour was ever wrong, which is what the ffmpeg-backed test now pins.
+   */
+  it('repairs a click close to the true start of the buffer under overlap-save', () => {
+    const frames = 8000;
+    const pcm = createPcm(1, frames, RATE);
+    for (let i = 0; i < frames; i++) pcm.channels[0][i] = 0.4 * Math.sin((2 * Math.PI * 300 * i) / RATE);
+    const trueValue = pcm.channels[0][50];
+    pcm.channels[0][50] = -0.95;
+
+    const declickSpec = findEffect('declick')!;
+    const out = declickSpec.apply(pcm, { start: 0, end: frames }, { ...declickSpec.defaults, method: 1 });
+
+    expect(Math.abs(out.channels[0][50] - trueValue)).toBeLessThan(0.01);
+  });
+
+  it('quiets a section below its threshold and leaves a loud one alone', () => {
+    const frames = 30000;
+    const pcm = createPcm(1, frames, RATE);
+    for (let i = 0; i < frames; i++) {
+      // Loud for the first half, quiet (below the -18 dBFS-ish default
+      // threshold of 0.125) for the second.
+      const amplitude = i < frames / 2 ? 0.6 : 0.02;
+      pcm.channels[0][i] = amplitude * Math.sin((2 * Math.PI * 300 * i) / RATE);
+    }
+
+    const gateSpec = findEffect('agate')!;
+    const out = gateSpec.apply(pcm, { start: 0, end: frames }, gateSpec.defaults);
+
+    const peak = (from: number, to: number): number => {
+      let value = 0;
+      for (let i = from; i < to; i++) value = Math.max(value, Math.abs(out.channels[0][i]));
+      return value;
+    };
+    // Well after the release has settled, near the end of each half.
+    expect(peak(frames / 2 - 2000, frames / 2 - 500), 'loud section').toBeGreaterThan(0.5);
+    expect(peak(frames - 2000, frames - 500), 'gated quiet section').toBeLessThan(0.02);
+  });
+
+  it('boosts energy at the target frequency and cuts it in the opposite direction', () => {
+    const frames = 8192;
+    const pcm = createPcm(1, frames, RATE);
+    for (let i = 0; i < frames; i++) pcm.channels[0][i] = 0.2 * Math.sin((2 * Math.PI * 1000 * i) / RATE);
+
+    const energy = (channel: Float32Array): number => {
+      let sum = 0;
+      for (let i = 1000; i < frames; i++) sum += channel[i] * channel[i];
+      return sum;
+    };
+
+    const equalizerSpec = findEffect('equalizer')!;
+    const source = energy(pcm.channels[0]);
+    const boosted = equalizerSpec.apply(pcm, { start: 0, end: frames }, { frequency: 1000, width: 1, gain: 12 });
+    const cut = equalizerSpec.apply(pcm, { start: 0, end: frames }, { frequency: 1000, width: 1, gain: -12 });
+
+    expect(energy(boosted.channels[0])).toBeGreaterThan(source * 2);
+    expect(energy(cut.channels[0])).toBeLessThan(source * 0.5);
   });
 });

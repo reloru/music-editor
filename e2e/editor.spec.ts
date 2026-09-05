@@ -257,7 +257,7 @@ test.describe('editor', () => {
     await page.locator('[data-command="effects"]').click();
 
     const rows = page.locator('#effects-list .effect-list__item');
-    await expect(rows).toHaveCount(16);
+    await expect(rows).toHaveCount(19);
     await expect(page.locator('#effects-scope')).toHaveText('Applies to the whole track.');
 
     await rows.filter({ hasText: 'Tremolo' }).click();
@@ -369,6 +369,33 @@ test.describe('editor', () => {
     // A preview is not an edit.
     await expect(page.locator('#undo')).toBeDisabled();
     await page.locator('#effect-sheet button[value="cancel"]').click();
+    await expect(page.locator('#undo')).toBeDisabled();
+  });
+
+  test('previews a declick effect that reads context outside the selection', async ({ page }) => {
+    await openFixture(page);
+    await selectMiddle(page);
+    await page.locator('[data-command="effects"]').click();
+    await page.locator('.effect-list__item').filter({ hasText: 'Declick' }).click();
+
+    const preview = page.locator('#effect-preview');
+    await preview.click();
+    await expect(preview).toHaveText('Stop preview');
+    await preview.click();
+    await expect(preview).toHaveText('Preview');
+    await page.locator('#effect-sheet button[value="cancel"]').click();
+  });
+
+  test('cleans a stem with one tap as a single undo step', async ({ page }) => {
+    await openFixture(page);
+    await expect(page.locator('#undo')).toBeDisabled();
+
+    await page.locator('[data-command="clean-stem"]').click();
+    await expect(page.locator('#undo')).toBeEnabled();
+    await expect(page.locator('#undo')).toHaveAttribute('title', 'Undo Clean stem');
+    await expect(page.locator('#readout-duration')).toHaveText('0:03.00');
+
+    await page.locator('#undo').click();
     await expect(page.locator('#undo')).toBeDisabled();
   });
 
