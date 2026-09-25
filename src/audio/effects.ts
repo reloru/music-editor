@@ -1300,17 +1300,24 @@ export function declickContextSamples(sampleRate: number, p: EffectValues): numb
  */
 const DECLICK_YIELD_INTERVAL_MS = 16;
 
-function cooperativeYielder(): () => Promise<void> {
+/** The returned function resolves true when it actually yielded. */
+function cooperativeYielder(): () => Promise<boolean> {
   let last = performance.now();
   return async () => {
     const now = performance.now();
-    if (now - last < DECLICK_YIELD_INTERVAL_MS) return;
+    if (now - last < DECLICK_YIELD_INTERVAL_MS) return false;
     last = now;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    return true;
   };
 }
 
-export async function declick(pcm: Pcm, range: Range, p: EffectValues): Promise<Pcm> {
+export async function declick(
+  pcm: Pcm,
+  range: Range,
+  p: EffectValues,
+  onProgress?: (fraction: number) => void,
+): Promise<Pcm> {
   const { out, start, end } = prepare(pcm, range);
   if (end <= start) return out;
 
@@ -1350,6 +1357,8 @@ export async function declick(pcm: Pcm, range: Range, p: EffectValues): Promise<
 
   const winSrc = new Float64Array(windowSize);
   const yieldPeriodically = cooperativeYielder();
+  const windowsPerChannel = Math.max(1, Math.ceil((end - (method === 0 ? timelineStart : timelineStart + skip)) / hopSize));
+  const windowsTotal = windowsPerChannel * pcm.channels.length;
 
   for (let c = 0; c < pcm.channels.length; c++) {
     const source = pcm.channels[c];
@@ -1361,7 +1370,7 @@ export async function declick(pcm: Pcm, range: Range, p: EffectValues): Promise<
       const emitStart = method === 0 ? windowStart : windowStart + skip;
       if (emitStart >= end) break;
 
-      await yieldPeriodically();
+      if (await yieldPeriodically()) onProgress?.(Math.min(1, (c * windowsPerChannel + k) / windowsTotal));
 
       for (let j = 0; j < windowSize; j++) winSrc[j] = read(source, windowStart + j);
       const dst = declickWindow(winSrc, arOrder, threshold, nbBurstSamples);
@@ -1474,10 +1483,22 @@ function declickInterpolate(
   const n = index.length;
   const matrix = new Float64Array(n * n);
 
+  // Row i is nonzero only in columns [lo[i], hi[i]): the clicks within
+  // arOrder samples of click i. `index` is sorted, so both bounds are
+  // nondecreasing in i.
+  const lo = new Int32Array(n);
+  const hi = new Int32Array(n);
+  for (let i = 0, a = 0, b = 0; i < n; i++) {
+    while (index[i] - index[a] > arOrder) a++;
+    if (b < i) b = i;
+    while (b < n && index[b] - index[i] <= arOrder) b++;
+    lo[i] = a;
+    hi[i] = b;
+  }
+
   for (let i = 0; i < n; i++) {
-    for (let j = i; j < n; j++) {
-      const distance = Math.abs(index[j] - index[i]);
-      const value = distance <= arOrder ? auxiliary[distance] : 0;
+    for (let j = i; j < hi[i]; j++) {
+      const value = auxiliary[index[j] - index[i]];
       matrix[j * n + i] = value;
       matrix[i * n + j] = value;
     }
@@ -1493,7 +1514,7 @@ function declickInterpolate(
     vector[i] = value;
   }
 
-  return solveLdl(matrix, vector, n);
+  return solveLdl(matrix, vector, n, lo, hi);
 }
 
 /** Binary search over the sorted click positions: is `value` itself a click? */
@@ -1516,40 +1537,54 @@ function indexContains(index: number[], value: number): boolean {
  * holds L. Ported line for line rather than swapped for a pivoted solver,
  * since the accumulation order is what a bit-exact comparison against ffmpeg
  * depends on.
+ *
+ * Row i of the input is zero outside columns `[lo[i], hi[i])`, and LDLᵀ
+ * without pivoting creates no fill outside that envelope, so every term the
+ * loops below skip is an exact zero in ffmpeg's dense version too.
+ * Subtracting an exact zero leaves a double unchanged, so the sums over the
+ * remaining terms, taken in the same order, give the same results — at
+ * O(n·arOrder²) instead of O(n³). With a few hundred clicks in a window, the
+ * dense form was most of the running time of a whole-track declick.
  */
-function factorizeLdl(matrix: Float64Array, n: number): boolean {
+function factorizeLdl(matrix: Float64Array, n: number, lo: Int32Array, hi: Int32Array): boolean {
   for (let i = 0; i < n; i++) {
     const rowI = i * n;
     let value = matrix[rowI + i];
-    for (let j = 0; j < i; j++) value -= matrix[j * n + j] * matrix[rowI + j] * matrix[rowI + j];
+    for (let j = lo[i]; j < i; j++) value -= matrix[j * n + j] * matrix[rowI + j] * matrix[rowI + j];
     if (value === 0) return false;
     matrix[rowI + i] = value;
 
-    for (let j = i + 1; j < n; j++) {
+    for (let j = i + 1; j < hi[i]; j++) {
       const rowJ = j * n;
       let x = matrix[rowJ + i];
-      for (let k = 0; k < i; k++) x -= matrix[k * n + k] * matrix[rowI + k] * matrix[rowJ + k];
+      for (let k = lo[j]; k < i; k++) x -= matrix[k * n + k] * matrix[rowI + k] * matrix[rowJ + k];
       matrix[rowJ + i] = x / matrix[rowI + i];
     }
   }
   return true;
 }
 
-function solveLdl(matrix: Float64Array, vector: Float64Array, n: number): Float64Array | null {
-  if (!factorizeLdl(matrix, n)) return null;
+function solveLdl(
+  matrix: Float64Array,
+  vector: Float64Array,
+  n: number,
+  lo: Int32Array,
+  hi: Int32Array,
+): Float64Array | null {
+  if (!factorizeLdl(matrix, n, lo, hi)) return null;
 
   const y = new Float64Array(n);
   for (let i = 0; i < n; i++) {
     const rowI = i * n;
     let value = vector[i];
-    for (let j = 0; j < i; j++) value -= matrix[rowI + j] * y[j];
+    for (let j = lo[i]; j < i; j++) value -= matrix[rowI + j] * y[j];
     y[i] = value;
   }
 
   const out = new Float64Array(n);
   for (let i = n - 1; i >= 0; i--) {
     out[i] = y[i] / matrix[i * n + i];
-    for (let j = i + 1; j < n; j++) out[i] -= matrix[j * n + i] * out[j];
+    for (let j = i + 1; j < hi[i]; j++) out[i] -= matrix[j * n + i] * out[j];
   }
   return out;
 }
@@ -1609,6 +1644,7 @@ export async function cleanStem(
   range: Range,
   declickDefaults: EffectValues,
   gateDefaults: EffectValues,
+  onProgress?: (fraction: number) => void,
 ): Promise<Pcm> {
-  return gate(await declick(pcm, range, declickDefaults), range, gateDefaults);
+  return gate(await declick(pcm, range, declickDefaults, onProgress), range, gateDefaults);
 }

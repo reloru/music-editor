@@ -523,7 +523,7 @@ export class Editor {
     if (!declickSpec || !gateSpec) return;
     const range = this.effectiveRange;
     await this.applyEdit('Clean stem', (pcm) =>
-      cleanStemEffect(pcm, range, declickSpec.defaults, gateSpec.defaults),
+      cleanStemEffect(pcm, range, declickSpec.defaults, gateSpec.defaults, (fraction) => this.setProgress(fraction)),
     );
   }
 
