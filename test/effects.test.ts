@@ -367,6 +367,27 @@ describe('declick, gate and equalizer', () => {
     expect(Math.abs(out.channels[0][50] - trueValue)).toBeLessThan(0.01);
   });
 
+  it('reports nondecreasing progress across channels while it runs', async () => {
+    const frames = RATE * 5;
+    const pcm = createPcm(2, frames, RATE);
+    let seed = 1;
+    for (let c = 0; c < 2; c++) {
+      for (let i = 0; i < frames; i++) {
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        pcm.channels[c][i] = 0.3 * Math.sin((2 * Math.PI * 220 * i) / RATE) + 0.2 * (seed / 2 ** 32 - 0.5);
+      }
+    }
+
+    const reports: number[] = [];
+    await fx.declick(pcm, { start: 0, end: frames }, findEffect('declick')!.defaults, (f) => reports.push(f));
+
+    expect(reports.length).toBeGreaterThan(1);
+    for (let i = 1; i < reports.length; i++) expect(reports[i]).toBeGreaterThanOrEqual(reports[i - 1]);
+    expect(reports[0]).toBeGreaterThanOrEqual(0);
+    expect(reports[reports.length - 1]).toBeLessThanOrEqual(1);
+    expect(reports.some((f) => f > 0.5), 'progress should reach the second channel').toBe(true);
+  });
+
   it('quiets a section below its threshold and leaves a loud one alone', async () => {
     const frames = 30000;
     const pcm = createPcm(1, frames, RATE);
