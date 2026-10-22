@@ -1,5 +1,11 @@
 import './styles.css';
+import { createDeclickPool } from './audio/declick-pool';
+import { setDeclickExecutor } from './audio/effects';
 import { App } from './ui/app';
+
+// Declick is the slowest edit, so it fans out across Web Workers when the
+// browser has them and falls back to the main thread when it does not.
+setDeclickExecutor(createDeclickPool());
 
 const app = new App();
 

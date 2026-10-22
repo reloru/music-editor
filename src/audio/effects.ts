@@ -1312,6 +1312,152 @@ function cooperativeYielder(): () => Promise<boolean> {
   };
 }
 
+/** What a `declick` run needs to know about its window grid. */
+interface DeclickGrid {
+  windowSize: number;
+  arOrder: number;
+  nbBurstSamples: number;
+  hopSize: number;
+  method: 0 | 1;
+  skip: number;
+  threshold: number;
+  /** Absolute sample index at which window 0 starts. May be negative for `method: save`. */
+  timelineStart: number;
+}
+
+/**
+ * One independent slice of a `declick` run: windows `[kFrom, kTo)` of one
+ * channel. Self-contained and made of plain typed arrays, so it can be handed
+ * to a Web Worker as is.
+ */
+export interface DeclickTask {
+  grid: DeclickGrid;
+  /** A copy of the channel's samples covering every window the task reads. */
+  samples: Float32Array;
+  /** Absolute index of `samples[0]`. */
+  base: number;
+  /** True length of the whole channel — reads past either end of it are zero. */
+  total: number;
+  /** The range being edited; nothing outside it is emitted. */
+  start: number;
+  end: number;
+  kFrom: number;
+  kTo: number;
+}
+
+export interface DeclickTaskResult {
+  /** Absolute index of `samples[0]`. */
+  from: number;
+  samples: Float32Array;
+}
+
+/** A task that has not been built yet, so a queue of them holds no audio. */
+export interface DeclickTaskSpec {
+  channel: number;
+  /** How many windows the task will run — for progress. */
+  windows: number;
+  build(): DeclickTask;
+}
+
+/**
+ * Runs declick tasks somewhere other than the calling thread. `size` is how
+ * many tasks it can usefully run at once. Results come back in task order.
+ */
+export interface DeclickExecutor {
+  size: number;
+  run(specs: DeclickTaskSpec[], onTaskDone: (spec: DeclickTaskSpec) => void): Promise<DeclickTaskResult[]>;
+}
+
+let declickExecutor: DeclickExecutor | null = null;
+
+/** Installs (or, with null, removes) the executor `declick` hands long runs to. */
+export function setDeclickExecutor(executor: DeclickExecutor | null): void {
+  declickExecutor = executor;
+}
+
+/** Below this many windows, starting a worker costs more than it saves. */
+const MIN_WINDOWS_FOR_EXECUTOR = 48;
+/** Smallest slice worth its own task: each task re-runs a few warm-up windows. */
+const MIN_WINDOWS_PER_TASK = 24;
+/** Tasks per executor slot, so one slow slice does not leave the others idle. */
+const TASKS_PER_SLOT = 3;
+
+/**
+ * Runs one task's windows, yielding after each. The overlap-add accumulator is
+ * warmed up by running the `contextHops` windows before `kFrom` with their
+ * output discarded: those are exactly the earlier windows that overlap the
+ * first emitted hop, and they are summed in the same order a single sequential
+ * pass sums them, so the result is bit-identical to one.
+ */
+function* declickTaskSteps(task: DeclickTask): Generator<number, DeclickTaskResult, void> {
+  const { grid, samples, base, total, start, end, kFrom, kTo } = task;
+  const { windowSize, arOrder, nbBurstSamples, hopSize, method, skip, timelineStart } = grid;
+
+  const emitOffset = method === 0 ? 0 : skip;
+  const emitStartOf = (k: number): number => timelineStart + emitOffset + k * hopSize;
+  const from = Math.max(start, emitStartOf(kFrom));
+  const to = Math.min(end, emitStartOf(kTo - 1) + hopSize);
+  const result = new Float32Array(Math.max(0, to - from));
+
+  const contextHops = method === 0 ? Math.ceil((windowSize - hopSize) / hopSize) : 0;
+  const lut = method === 0 ? declickWindowLut(windowSize, hopSize) : null;
+  const accumulator = method === 0 ? new Float64Array(windowSize * 2) : null;
+  const winSrc = new Float64Array(windowSize);
+  const read = (i: number): number => (i >= 0 && i < total ? samples[i - base] : 0);
+
+  for (let k = Math.max(0, kFrom - contextHops); k < kTo; k++) {
+    const windowStart = timelineStart + k * hopSize;
+    for (let j = 0; j < windowSize; j++) winSrc[j] = read(windowStart + j);
+    const dst = declickWindow(winSrc, arOrder, grid.threshold, nbBurstSamples);
+
+    let emit: Float64Array;
+    if (method === 0) {
+      const acc = accumulator as Float64Array;
+      for (let j = 0; j < windowSize; j++) acc[j] += dst[j] * (lut as Float64Array)[j];
+      emit = acc.subarray(0, hopSize);
+    } else {
+      emit = dst.subarray(skip, skip + hopSize);
+    }
+
+    if (k >= kFrom) {
+      const emitStart = emitStartOf(k);
+      for (let m = 0; m < hopSize; m++) {
+        const absolute = emitStart + m;
+        if (absolute >= from && absolute < to) result[absolute - from] = emit[m];
+      }
+    }
+
+    if (method === 0) {
+      const acc = accumulator as Float64Array;
+      acc.copyWithin(0, hopSize);
+      acc.fill(0, acc.length - hopSize);
+    }
+    yield k;
+  }
+  return { from, samples: result };
+}
+
+/** Runs a task start to finish without yielding — what a worker does. */
+export function runDeclickTask(task: DeclickTask): DeclickTaskResult {
+  const steps = declickTaskSteps(task);
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+  }
+}
+
+/** Runs a task on the calling thread, yielding to the event loop as it goes. */
+async function runDeclickTaskCooperatively(task: DeclickTask, onWindow: () => void): Promise<DeclickTaskResult> {
+  const yieldPeriodically = cooperativeYielder();
+  const steps = declickTaskSteps(task);
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+    onWindow();
+    await yieldPeriodically();
+  }
+}
+
 export async function declick(
   pcm: Pcm,
   range: Range,
@@ -1321,14 +1467,10 @@ export async function declick(
   const { out, start, end } = prepare(pcm, range);
   if (end <= start) return out;
 
-  const sampleRate = pcm.sampleRate;
-  const windowSize = Math.max(100, Math.trunc((sampleRate * p.window) / 1000));
-  const arOrder = Math.max(1, Math.trunc((windowSize * p.arOrder) / 100));
-  const nbBurstSamples = Math.trunc((windowSize * p.burst) / 1000);
+  const windowSize = Math.max(100, Math.trunc((pcm.sampleRate * p.window) / 1000));
   const hopSize = Math.max(1, Math.trunc(windowSize * (1 - p.overlap / 100)));
   const method = p.method >= 0.5 ? 1 : 0;
   const skip = Math.floor((windowSize - hopSize) / 2);
-  const threshold = p.threshold;
 
   // How many hops of pure left context bring the overlap-add accumulator to
   // full level before the first kept sample — see the doc comment above.
@@ -1349,52 +1491,91 @@ export async function declick(
   // ffmpeg's own cold-start ramp where that is genuinely all there is to work
   // with, which is the one place this port does not try to improve on it.
   const contextHops = method === 0 ? Math.ceil((windowSize - hopSize) / hopSize) : 0;
-  const timelineStart = method === 0 ? Math.max(0, start - contextHops * hopSize) : start - skip;
+  const grid: DeclickGrid = {
+    windowSize,
+    arOrder: Math.max(1, Math.trunc((windowSize * p.arOrder) / 100)),
+    nbBurstSamples: Math.trunc((windowSize * p.burst) / 1000),
+    hopSize,
+    method,
+    skip,
+    threshold: p.threshold,
+    timelineStart: method === 0 ? Math.max(0, start - contextHops * hopSize) : start - skip,
+  };
 
-  const lut = method === 0 ? declickWindowLut(windowSize, hopSize) : null;
   const total = frameCount(pcm);
-  const read = (channel: Float32Array, i: number): number => (i >= 0 && i < total ? channel[i] : 0);
-
-  const winSrc = new Float64Array(windowSize);
-  const yieldPeriodically = cooperativeYielder();
-  const windowsPerChannel = Math.max(1, Math.ceil((end - (method === 0 ? timelineStart : timelineStart + skip)) / hopSize));
+  const firstEmit = grid.timelineStart + (method === 0 ? 0 : skip);
+  const windowsPerChannel = Math.max(0, Math.ceil((end - firstEmit) / hopSize));
   const windowsTotal = windowsPerChannel * pcm.channels.length;
+  if (windowsTotal === 0) return out;
+
+  const specs: DeclickTaskSpec[] = [];
+  const executor =
+    declickExecutor && declickExecutor.size > 1 && windowsTotal >= MIN_WINDOWS_FOR_EXECUTOR ? declickExecutor : null;
+  const segments = executor
+    ? Math.max(
+        1,
+        Math.min(
+          Math.ceil((executor.size * TASKS_PER_SLOT) / pcm.channels.length),
+          Math.floor(windowsPerChannel / MIN_WINDOWS_PER_TASK),
+        ),
+      )
+    : 1;
 
   for (let c = 0; c < pcm.channels.length; c++) {
-    const source = pcm.channels[c];
-    const target = out.channels[c];
-    const accumulator = method === 0 ? new Float64Array(windowSize * 2) : null;
-
-    for (let k = 0; ; k++) {
-      const windowStart = timelineStart + k * hopSize;
-      const emitStart = method === 0 ? windowStart : windowStart + skip;
-      if (emitStart >= end) break;
-
-      if (await yieldPeriodically()) onProgress?.(Math.min(1, (c * windowsPerChannel + k) / windowsTotal));
-
-      for (let j = 0; j < windowSize; j++) winSrc[j] = read(source, windowStart + j);
-      const dst = declickWindow(winSrc, arOrder, threshold, nbBurstSamples);
-
-      let emit: Float64Array;
-      if (method === 0) {
-        const acc = accumulator as Float64Array;
-        for (let j = 0; j < windowSize; j++) acc[j] += dst[j] * (lut as Float64Array)[j];
-        emit = acc.subarray(0, hopSize);
-      } else {
-        emit = dst.subarray(skip, skip + hopSize);
-      }
-
-      for (let m = 0; m < hopSize; m++) {
-        const absolute = emitStart + m;
-        if (absolute >= start && absolute < end) target[absolute] = emit[m];
-      }
-
-      if (method === 0) {
-        const acc = accumulator as Float64Array;
-        acc.copyWithin(0, hopSize);
-        acc.fill(0, acc.length - hopSize);
-      }
+    for (let s = 0; s < segments; s++) {
+      const kFrom = Math.floor((s * windowsPerChannel) / segments);
+      const kTo = Math.floor(((s + 1) * windowsPerChannel) / segments);
+      if (kTo <= kFrom) continue;
+      specs.push({
+        channel: c,
+        windows: kTo - kFrom,
+        build() {
+          // Every window the task runs, warm-up included, and nothing more.
+          const first = Math.max(0, kFrom - contextHops);
+          const lo = Math.max(0, grid.timelineStart + first * hopSize);
+          const hi = Math.min(total, grid.timelineStart + (kTo - 1) * hopSize + windowSize);
+          return {
+            grid,
+            samples: pcm.channels[c].slice(lo, Math.max(lo, hi)),
+            base: lo,
+            total,
+            start,
+            end,
+            kFrom,
+            kTo,
+          };
+        },
+      });
     }
+  }
+
+  const write = (spec: DeclickTaskSpec, result: DeclickTaskResult): void => {
+    out.channels[spec.channel].set(result.samples, result.from);
+  };
+
+  if (executor) {
+    let doneWindows = 0;
+    try {
+      const results = await executor.run(specs, (spec) => {
+        doneWindows += spec.windows;
+        onProgress?.(Math.min(1, doneWindows / windowsTotal));
+      });
+      specs.forEach((spec, i) => write(spec, results[i]));
+      return out;
+    } catch (error) {
+      // Workers can fail to start (a locked-down browser, no memory to spare).
+      // The edit still has to finish, so fall through to the in-thread path.
+      console.warn('declick workers failed, running on the main thread', error);
+    }
+  }
+
+  let windowsDone = 0;
+  for (const spec of specs) {
+    const result = await runDeclickTaskCooperatively(spec.build(), () => {
+      windowsDone++;
+      if (windowsDone % 8 === 0) onProgress?.(Math.min(1, windowsDone / windowsTotal));
+    });
+    write(spec, result);
   }
   return out;
 }
