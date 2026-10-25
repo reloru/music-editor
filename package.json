@@ -29,7 +29,7 @@
     "@types/node": "^26.2.0",
     "typescript": "^5.9.3",
     "vite": "^8.2.1",
-    "vitest": "^4.1.11",
+    "vitest": "^4.1.12",
     "wrangler": "^4.147.0"
   }
 }
